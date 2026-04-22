@@ -109,7 +109,7 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 - `校准为中文`
 - `校准为英文`
 
-如果应用检测到可能漏掉了一次 Shift 切换，例如启动瞬间按了 Shift、事件监听被系统临时禁用、或者 Shift 按下到松开期间输入源发生变化，菜单栏会显示 `?`。这种情况下请用菜单里的校准项重新同步。
+如果应用检测到可能漏掉了一次 Shift 切换，例如启动瞬间按了 Shift，或者 Shift 按下到松开期间输入源发生变化，菜单栏会显示 `?`。这种情况下请用菜单里的校准项重新同步。
 
 ### 输入监控权限
 

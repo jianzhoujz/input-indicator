@@ -369,9 +369,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         eventTapActive = false
         resetShiftTracking()
         refreshInputSource()
-        if isTargetInputMethodSelected {
-            markTargetModeUnknown(reason: "event tap disabled by \(type)")
-        }
+        log("event tap disabled reason=\(type)")
 
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: true)
@@ -696,6 +694,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         targetModeChinese = true
         targetModeKnown = true
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+        log("mode calibrated mode=中文")
         updateTitle()
         rebuildMenu()
     }
@@ -704,6 +703,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         targetModeChinese = false
         targetModeKnown = true
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+        log("mode calibrated mode=英文")
         updateTitle()
         rebuildMenu()
     }

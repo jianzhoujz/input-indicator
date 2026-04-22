@@ -42,16 +42,11 @@ private struct AppConfig {
 }
 
 private let gitHubRepository = "jianzhoujz/input-indicator"
-private let latestReleaseURL = URL(string: "https://api.github.com/repos/\(gitHubRepository)/releases/latest")!
+private let latestReleaseURL = URL(string: "https://github.com/\(gitHubRepository)/releases/latest")!
 
-private struct GitHubRelease: Decodable {
+private struct GitHubRelease {
     let tagName: String
     let htmlURL: URL
-
-    private enum CodingKeys: String, CodingKey {
-        case tagName = "tag_name"
-        case htmlURL = "html_url"
-    }
 }
 
 private struct VersionNumber: Comparable {
@@ -291,10 +286,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func handle(event: NSEvent) {
-        guard !eventTapActive else {
-            return
-        }
-
         let keyCode = event.type == .flagsChanged ? Int64(event.keyCode) : nil
         guard !shouldIgnoreEventDuringStartup(source: "nsevent", keyCode: keyCode) else {
             return
@@ -739,12 +730,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         log("checking updates url=\(latestReleaseURL.absoluteString)")
 
         var request = URLRequest(url: latestReleaseURL)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.httpMethod = "HEAD"
+        request.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
         request.setValue("\(appConfig.appName)/\(appVersion)", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             DispatchQueue.main.async {
-                self?.finishUpdateCheck(data: data, response: response, error: error)
+                self?.finishUpdateCheck(response: response, error: error)
             }
         }.resume()
     }
@@ -753,7 +745,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         NSApp.terminate(nil)
     }
 
-    private func finishUpdateCheck(data: Data?, response: URLResponse?, error: Error?) {
+    private func finishUpdateCheck(response: URLResponse?, error: Error?) {
         updateCheckInProgress = false
         rebuildMenu()
 
@@ -781,25 +773,38 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
 
-        guard let data else {
-            log("update check failed reason=empty-data")
-            showMessage(title: "检查更新失败", message: "GitHub 返回内容为空。")
+        guard let release = latestRelease(from: httpResponse) else {
+            log("update check failed reason=missing-release-tag finalURL=\(httpResponse.url?.absoluteString ?? "")")
+            showMessage(title: "检查更新失败", message: "无法识别 GitHub 最新 Release 版本。")
             return
         }
 
-        do {
-            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-            log("latest release tag=\(release.tagName) current=\(appVersion)")
+        log("latest release tag=\(release.tagName) current=\(appVersion)")
 
-            if VersionNumber(appVersion) < VersionNumber(release.tagName) {
-                showUpdateAvailable(release)
-            } else {
-                showMessage(title: "已是最新版本", message: "\(appConfig.displayName) 当前版本为 \(appVersion)。")
-            }
-        } catch {
-            log("update check decode failed error=\(error.localizedDescription)")
-            showMessage(title: "检查更新失败", message: "无法解析 GitHub Release 信息。")
+        if VersionNumber(appVersion) < VersionNumber(release.tagName) {
+            showUpdateAvailable(release)
+        } else {
+            showMessage(title: "已是最新版本", message: "\(appConfig.displayName) 当前版本为 \(appVersion)。")
         }
+    }
+
+    private func latestRelease(from response: HTTPURLResponse) -> GitHubRelease? {
+        guard let finalURL = response.url else {
+            return nil
+        }
+
+        let pathComponents = finalURL.pathComponents
+        guard let tagIndex = pathComponents.firstIndex(of: "tag"),
+              tagIndex + 1 < pathComponents.count else {
+            return nil
+        }
+
+        let tagName = pathComponents[tagIndex + 1].removingPercentEncoding ?? pathComponents[tagIndex + 1]
+        guard !tagName.isEmpty else {
+            return nil
+        }
+
+        return GitHubRelease(tagName: tagName, htmlURL: finalURL)
     }
 
     private func showUpdateAvailable(_ release: GitHubRelease) {

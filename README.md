@@ -27,23 +27,31 @@
 
 ### Homebrew
 
+先添加 tap：
+
 ```bash
 brew tap jianzhoujz/tap
-brew install --cask jianzhoujz/tap/doubao-input-indicator
 ```
 
-微信输入法版本：
+然后根据你使用的输入法二选一安装。
+
+豆包输入法：
 
 ```bash
-brew tap jianzhoujz/tap
-brew install --cask jianzhoujz/tap/wetype-input-indicator
+brew install --cask doubao-input-indicator
+```
+
+微信输入法：
+
+```bash
+brew install --cask wetype-input-indicator
 ```
 
 卸载：
 
 ```bash
-brew uninstall --cask jianzhoujz/tap/doubao-input-indicator
-brew uninstall --cask jianzhoujz/tap/wetype-input-indicator
+brew uninstall --cask doubao-input-indicator
+brew uninstall --cask wetype-input-indicator
 ```
 
 ### GitHub Releases

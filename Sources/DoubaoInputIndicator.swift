@@ -132,6 +132,7 @@ private final class InputSourceReader {
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: 22)
     private let menu = NSMenu()
+    private let maximumStandaloneShiftTapDuration: CFAbsoluteTime = 1.0
 
     private var timer: Timer?
     private var eventTap: CFMachPort?
@@ -140,6 +141,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private var currentSource = InputSourceReader.Source(id: "", name: "", bundleID: "", inputModeID: "")
     private var targetModeChinese = UserDefaults.standard.object(forKey: appConfig.modeStateKey) as? Bool ?? true
+    private var targetModeKnown = UserDefaults.standard.object(forKey: appConfig.modeStateKey) is Bool
     private var listenAccessGranted = false
     private var observedInputEvent = false
     private var eventTapActive = false
@@ -147,10 +149,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private var shiftDownAt: CFAbsoluteTime?
     private var shiftDownKeyCode: Int64?
+    private var shiftDownSourceID = ""
+    private var shiftDownBundleID = ""
+    private var shiftDownWasTarget = false
     private var shiftHadOtherKey = false
+    private var shiftSourceChanged = false
     private var activeShiftKeys = Set<Int64>()
     private var ignoreEventsUntil = CFAbsoluteTimeGetCurrent() + 1.0
-    private var lastShiftToggleAt: CFAbsoluteTime = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -176,14 +181,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let source = eventRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
-        }
+        removeEventTap()
         if let globalFlagsMonitor {
             NSEvent.removeMonitor(globalFlagsMonitor)
         }
-        eventRunLoopSource = nil
-        eventTap = nil
         globalFlagsMonitor = nil
     }
 
@@ -216,6 +217,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func installEventTap() {
+        removeEventTap()
+
         let mask =
             (1 << CGEventType.flagsChanged.rawValue) |
             (1 << CGEventType.keyDown.rawValue) |
@@ -263,6 +266,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateTitle()
     }
 
+    private func removeEventTap() {
+        if let source = eventRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        if let eventTap {
+            CFMachPortInvalidate(eventTap)
+        }
+        eventRunLoopSource = nil
+        eventTap = nil
+        eventTapActive = false
+    }
+
     private func installGlobalMonitor() {
         globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] event in
             self?.handle(event: event)
@@ -276,7 +291,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func handle(event: NSEvent) {
-        guard CFAbsoluteTimeGetCurrent() >= ignoreEventsUntil else {
+        guard !eventTapActive else {
+            return
+        }
+
+        let keyCode = event.type == .flagsChanged ? Int64(event.keyCode) : nil
+        guard !shouldIgnoreEventDuringStartup(source: "nsevent", keyCode: keyCode) else {
             return
         }
         noteInputEvent()
@@ -299,7 +319,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func handle(type: CGEventType, event: CGEvent) {
-        guard CFAbsoluteTimeGetCurrent() >= ignoreEventsUntil else {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            handleEventTapDisabled(type)
+            return
+        default:
+            break
+        }
+
+        let keyCode = type == .flagsChanged ? event.getIntegerValueField(.keyboardEventKeycode) : nil
+        guard !shouldIgnoreEventDuringStartup(source: "cgevent", keyCode: keyCode) else {
             return
         }
         noteInputEvent()
@@ -316,26 +345,55 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
         case .flagsChanged:
             handleFlagsChanged(event)
-        case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let eventTap {
-                CGEvent.tapEnable(tap: eventTap, enable: true)
-                eventTapActive = true
-                updateTitle()
-                rebuildMenu()
-            }
         default:
             break
         }
     }
 
+    private func shouldIgnoreEventDuringStartup(source: String, keyCode: Int64?) -> Bool {
+        guard CFAbsoluteTimeGetCurrent() < ignoreEventsUntil else {
+            return false
+        }
+
+        if let keyCode, isShiftKey(keyCode) {
+            refreshInputSource()
+            if isTargetInputMethodSelected {
+                markTargetModeUnknown(reason: "shift event during startup ignore window from \(source)")
+            }
+        }
+
+        return true
+    }
+
+    private func handleEventTapDisabled(_ type: CGEventType) {
+        eventTapActive = false
+        resetShiftTracking()
+        refreshInputSource()
+        if isTargetInputMethodSelected {
+            markTargetModeUnknown(reason: "event tap disabled by \(type)")
+        }
+
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            eventTapActive = true
+            log("event tap re-enabled reason=\(type)")
+        }
+
+        updateTitle()
+        rebuildMenu()
+    }
+
     private func handleFlagsChanged(_ event: CGEvent) {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let isShiftKey = keyCode == 56 || keyCode == 60
-        guard isShiftKey else {
+        guard isShiftKey(keyCode) else {
             return
         }
 
         handleShiftKeyChange(source: "cgevent", keyCode: keyCode)
+    }
+
+    private func isShiftKey(_ keyCode: Int64) -> Bool {
+        keyCode == 56 || keyCode == 60
     }
 
     private func refreshInputSource() {
@@ -345,6 +403,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         if changed {
             log("source changed id=\(currentSource.id) name=\(currentSource.name) bundle=\(currentSource.bundleID) mode=\(currentSource.inputModeID)")
+            if shiftDownAt != nil {
+                shiftHadOtherKey = true
+                shiftSourceChanged = true
+                log("shift invalidated reason=source-changed")
+            }
             updateTitle()
             rebuildMenu()
         } else {
@@ -379,6 +442,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private var displayMode: DisplayMode {
         if isTargetInputMethodSelected {
+            guard targetModeKnown else {
+                return .unknown
+            }
             return targetModeChinese ? .chinese : .english
         }
 
@@ -399,8 +465,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func handleFlagsChanged(_ event: NSEvent) {
         let keyCode = Int64(event.keyCode)
-        let isShiftKey = keyCode == 56 || keyCode == 60
-        guard isShiftKey else {
+        guard isShiftKey(keyCode) else {
             return
         }
 
@@ -412,9 +477,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         if isDown {
             if activeShiftKeys.isEmpty {
+                refreshInputSource()
                 shiftDownAt = CFAbsoluteTimeGetCurrent()
                 shiftDownKeyCode = keyCode
+                shiftDownSourceID = currentSource.id
+                shiftDownBundleID = currentSource.bundleID
+                shiftDownWasTarget = isTargetInputMethodSelected
                 shiftHadOtherKey = false
+                shiftSourceChanged = false
                 log("shift down source=\(source) key=\(keyCode) current=\(currentSource.id)")
             }
             activeShiftKeys.insert(keyCode)
@@ -434,34 +504,65 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func finishShiftTap(source: String) {
-        guard shiftDownAt != nil else {
+        guard let startedAt = shiftDownAt else {
             return
         }
 
         defer {
             shiftDownAt = nil
             shiftDownKeyCode = nil
+            shiftDownSourceID = ""
+            shiftDownBundleID = ""
+            shiftDownWasTarget = false
             shiftHadOtherKey = false
+            shiftSourceChanged = false
             activeShiftKeys.removeAll()
         }
 
         guard !shiftHadOtherKey else {
             log("shift ignored source=\(source) reason=combined")
+            if shiftSourceChanged && shiftDownWasTarget {
+                markTargetModeUnknown(reason: "input source changed while shift was held")
+            }
             return
         }
 
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastShiftToggleAt >= 0.18 else {
-            log("shift ignored source=\(source) reason=debounce")
+        let duration = now - startedAt
+        guard duration <= maximumStandaloneShiftTapDuration else {
+            log("shift ignored source=\(source) reason=long duration=\(duration)")
+            if shiftDownWasTarget {
+                markTargetModeUnknown(reason: "standalone shift duration was too long")
+            }
+            return
+        }
+
+        refreshInputSource()
+
+        guard shiftDownWasTarget else {
+            log("shift ignored source=\(source) reason=started-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
             return
         }
 
         guard isTargetInputMethodSelected else {
-            log("shift ignored source=\(source) reason=not-target current=\(currentSource.id)")
+            log("shift ignored source=\(source) reason=ended-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
+            markTargetModeUnknown(reason: "target input source changed during shift tap")
             return
         }
 
-        lastShiftToggleAt = now
+        guard currentSource.id == shiftDownSourceID && currentSource.bundleID == shiftDownBundleID else {
+            log("shift ignored source=\(source) reason=source-changed start=\(shiftDownSourceID) current=\(currentSource.id)")
+            markTargetModeUnknown(reason: "input source changed during shift tap")
+            return
+        }
+
+        guard targetModeKnown else {
+            log("shift observed source=\(source) reason=unknown-mode-needs-calibration")
+            updateTitle()
+            rebuildMenu()
+            return
+        }
+
         targetModeChinese.toggle()
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
         log("shift toggled source=\(source) mode=\(displayMode.detail)")
@@ -469,8 +570,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         rebuildMenu()
     }
 
+    private func markTargetModeUnknown(reason: String) {
+        let hadSavedState = UserDefaults.standard.object(forKey: appConfig.modeStateKey) != nil
+        guard targetModeKnown || hadSavedState else {
+            return
+        }
+
+        targetModeKnown = false
+        UserDefaults.standard.removeObject(forKey: appConfig.modeStateKey)
+        log("mode marked unknown reason=\(reason)")
+        updateTitle()
+        rebuildMenu()
+    }
+
+    private func resetShiftTracking() {
+        shiftDownAt = nil
+        shiftDownKeyCode = nil
+        shiftDownSourceID = ""
+        shiftDownBundleID = ""
+        shiftDownWasTarget = false
+        shiftHadOtherKey = false
+        shiftSourceChanged = false
+        activeShiftKeys.removeAll()
+    }
+
     private func updateTitle() {
-        let title = needsInputMonitoringPermission ? "❗️" : displayMode.title
+        let title = needsInputMonitoringPermission ? "⚠️" : displayMode.title
 
         statusItem.button?.title = title
         statusItem.button?.toolTip = tooltipText()
@@ -481,6 +606,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         if needsInputMonitoringPermission {
             return "需要开启输入监控权限，Shift 同步才能工作。"
         }
+        if isTargetInputMethodSelected && !targetModeKnown {
+            return "\(sourceName): 需要校准中英文状态"
+        }
         return "\(sourceName): \(displayMode.detail)"
     }
 
@@ -489,7 +617,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let sourceName = currentSource.name.isEmpty ? currentSource.id : currentSource.name
         if needsInputMonitoringPermission {
-            let permission = NSMenuItem(title: "❗️ 输入监控权限未完成", action: nil, keyEquivalent: "")
+            let permission = NSMenuItem(title: "⚠️ 输入监控权限未完成", action: nil, keyEquivalent: "")
             permission.isEnabled = false
             menu.addItem(permission)
 
@@ -507,6 +635,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let status = NSMenuItem(title: "\(sourceName): \(displayMode.detail)", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+
+        if isTargetInputMethodSelected && !targetModeKnown {
+            let calibration = NSMenuItem(title: "状态需要校准", action: nil, keyEquivalent: "")
+            calibration.isEnabled = false
+            menu.addItem(calibration)
+        }
 
         #if WETYPE
         let wetypeShiftSetting = NSMenuItem(title: "微信输入法需开启「使用 shift 切换中英文」", action: nil, keyEquivalent: "")
@@ -560,6 +694,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func calibrateChinese() {
         targetModeChinese = true
+        targetModeKnown = true
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
         updateTitle()
         rebuildMenu()
@@ -567,6 +702,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func calibrateEnglish() {
         targetModeChinese = false
+        targetModeKnown = true
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
         updateTitle()
         rebuildMenu()

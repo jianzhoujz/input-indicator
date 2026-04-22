@@ -141,3 +141,11 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 ## 反馈与问题
 
 如果遇到状态不准、权限异常、安装失败或其他问题，请在 [GitHub Issues](https://github.com/jianzhoujz/input-indicator/issues) 提交反馈。
+
+## FAQ
+
+### 在哪里下载 Mac 版豆包输入法？
+
+官网还没有，但是网上有泄露的内测版，大家可以自行搜索下载，注意鉴别。
+
+![豆包输入法 Mac 内测版](docs/images/C9AE6EBE-3BC0-4EF8-9E7C-E0DBB2ED6576.png)

@@ -135,7 +135,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var globalFlagsMonitor: Any?
 
     private var currentSource = InputSourceReader.Source(id: "", name: "", bundleID: "", inputModeID: "")
-    private var hasRefreshedInputSource = false
     private var targetModeChinese = UserDefaults.standard.object(forKey: appConfig.modeStateKey) as? Bool ?? true
     private var targetModeKnown = UserDefaults.standard.object(forKey: appConfig.modeStateKey) is Bool
     private var listenAccessGranted = false
@@ -388,11 +387,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func refreshInputSource() {
         let next = InputSourceReader.current()
-        let wasInitialized = hasRefreshedInputSource
-        let wasTarget = isTargetInputMethod(currentSource)
-        let nextIsTarget = isTargetInputMethod(next)
         let changed = next.id != currentSource.id || next.inputModeID != currentSource.inputModeID || next.bundleID != currentSource.bundleID
-        hasRefreshedInputSource = true
         currentSource = next
 
         if changed {
@@ -401,9 +396,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftHadOtherKey = true
                 shiftSourceChanged = true
                 log("shift invalidated reason=source-changed")
-            }
-            if wasInitialized && !wasTarget && nextIsTarget {
-                setTargetModeChinese(reason: "target input source selected")
             }
             updateTitle()
             rebuildMenu()

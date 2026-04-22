@@ -111,8 +111,6 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 
 如果应用检测到可能漏掉了一次 Shift 切换，例如启动瞬间按了 Shift，或者 Shift 按下到松开期间输入源发生变化，菜单栏会显示 `?`。这种情况下请用菜单里的校准项重新同步。
 
-从 `ABC` 等其它输入源切回目标输入法时，输入法通常会回到中文状态；指示器会在这个切换时自动同步为中文。
-
 ### 输入监控权限
 
 如果菜单显示输入监控权限未完成，请打开：

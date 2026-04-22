@@ -135,6 +135,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var globalFlagsMonitor: Any?
 
     private var currentSource = InputSourceReader.Source(id: "", name: "", bundleID: "", inputModeID: "")
+    private var hasRefreshedInputSource = false
     private var targetModeChinese = UserDefaults.standard.object(forKey: appConfig.modeStateKey) as? Bool ?? true
     private var targetModeKnown = UserDefaults.standard.object(forKey: appConfig.modeStateKey) is Bool
     private var listenAccessGranted = false
@@ -387,7 +388,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func refreshInputSource() {
         let next = InputSourceReader.current()
+        let wasInitialized = hasRefreshedInputSource
+        let wasTarget = isTargetInputMethod(currentSource)
+        let nextIsTarget = isTargetInputMethod(next)
         let changed = next.id != currentSource.id || next.inputModeID != currentSource.inputModeID || next.bundleID != currentSource.bundleID
+        hasRefreshedInputSource = true
         currentSource = next
 
         if changed {
@@ -397,6 +402,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftSourceChanged = true
                 log("shift invalidated reason=source-changed")
             }
+            if wasInitialized && !wasTarget && nextIsTarget {
+                setTargetModeChinese(reason: "target input source selected")
+            }
             updateTitle()
             rebuildMenu()
         } else {
@@ -405,7 +413,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private var isTargetInputMethodSelected: Bool {
-        currentSource.bundleID == appConfig.targetInputMethodBundleID || currentSource.id.hasPrefix(appConfig.targetInputMethodBundleID)
+        isTargetInputMethod(currentSource)
+    }
+
+    private func isTargetInputMethod(_ source: InputSourceReader.Source) -> Bool {
+        source.bundleID == appConfig.targetInputMethodBundleID || source.id.hasPrefix(appConfig.targetInputMethodBundleID)
     }
 
     private var inputMonitoringUsable: Bool {
@@ -572,6 +584,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         rebuildMenu()
     }
 
+    private func setTargetModeChinese(reason: String) {
+        targetModeChinese = true
+        targetModeKnown = true
+        UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+        log("mode set mode=中文 reason=\(reason)")
+    }
+
     private func resetShiftTracking() {
         shiftDownAt = nil
         shiftDownKeyCode = nil
@@ -682,10 +701,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func calibrateChinese() {
-        targetModeChinese = true
-        targetModeKnown = true
-        UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
-        log("mode calibrated mode=中文")
+        setTargetModeChinese(reason: "manual calibration")
         updateTitle()
         rebuildMenu()
     }

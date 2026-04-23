@@ -42,6 +42,7 @@ private struct AppConfig {
 }
 
 private let gitHubRepository = "jianzhoujz/input-indicator"
+private let gitHubURL = URL(string: "https://github.com/jianzhoujz/input-indicator")!
 private let latestReleaseURL = URL(string: "https://github.com/\(gitHubRepository)/releases/latest")!
 
 private struct GitHubRelease {
@@ -124,6 +125,56 @@ private final class InputSourceReader {
     }
 }
 
+private final class CandidateWindowMonitor {
+
+    /// IME candidate panels and overlay popups typically sit at very high
+    /// window layers (near INT32_MAX ≈ 2_147_483_647).  Doubao uses layer
+    /// 2_147_483_628 for its candidate panel; WeType uses both 2_147_483_628
+    /// and 2_147_483_629.  We treat any layer above this threshold as a
+    /// potential candidate overlay.
+    private static let candidateLayerThreshold = 2_147_483_000
+
+    /// Find the PID of a running input method process by bundle ID.
+    static func findIMEProcessID(_ bundleID: String) -> pid_t? {
+        NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == bundleID
+        }?.processIdentifier
+    }
+
+    /// Returns `true` when the target IME currently has an on-screen candidate
+    /// window, indicating Chinese input mode is active.
+    static func isCandidateWindowVisible(bundleID: String) -> Bool {
+        guard let pid = findIMEProcessID(bundleID) else {
+            return false
+        }
+
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return false
+        }
+
+        return windowList.contains { info in
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerPID == pid else {
+                return false
+            }
+            let layer = info[kCGWindowLayer as String] as? Int ?? 0
+            guard layer >= candidateLayerThreshold else {
+                return false
+            }
+            // The candidate window has a non-zero size when displaying content
+            if let bounds = info[kCGWindowBounds as String] as? [String: Any],
+               let height = bounds["Height"] as? Int,
+               height > 0 {
+                return true
+            }
+            return false
+        }
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: 22)
     private let menu = NSMenu()
@@ -152,6 +203,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var activeShiftKeys = Set<Int64>()
     private var ignoreEventsUntil = CFAbsoluteTimeGetCurrent() + 1.0
 
+    // --- Candidate window auto-calibration ---
+    /// Timer used to defer the candidate window check after a key press.
+    private var candidateCheckTimer: Timer?
+    /// How many alphabetic key-downs we have seen since the last candidate
+    /// window check while the target IME is active.
+    private var pendingAlphaKeyCount = 0
+    /// Timestamp of the last successful auto-calibration to throttle checks.
+    private var lastAutoCalibrationAt: CFAbsoluteTime = 0
+    /// Minimum interval between auto-calibrations (seconds).
+    private let autoCalibrationCooldown: CFAbsoluteTime = 2.0
+
+    // --- Shift tracking improvements ---
+    /// Tracks the previous input source so we can detect switching back to the
+    /// target IME from another source.
+    private var previousSourceBundleID = ""
+    /// Minimum gap between consecutive shift toggles (seconds). Doubao's
+    /// internal `ShiftKeyEventCoalescer` debounces rapid repeats; we mirror
+    /// that here to stay in sync.
+    private let minimumShiftToggleGap: CFAbsoluteTime = 0.35
+    /// Timestamp of the last accepted shift toggle.
+    private var lastShiftToggleAt: CFAbsoluteTime = 0
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         ignoreEventsUntil = CFAbsoluteTimeGetCurrent() + 1.0
@@ -177,6 +250,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         removeEventTap()
+        candidateCheckTimer?.invalidate()
+        candidateCheckTimer = nil
         if let globalFlagsMonitor {
             NSEvent.removeMonitor(globalFlagsMonitor)
         }
@@ -297,6 +372,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
+            noteAlphaKeyDown(keyCode: Int64(event.keyCode))
         case .leftMouseDown, .rightMouseDown, .otherMouseDown,
              .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if shiftDownAt != nil {
@@ -329,6 +405,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
+            noteAlphaKeyDown(keyCode: event.getIntegerValueField(.keyboardEventKeycode))
         case .leftMouseDown, .rightMouseDown, .otherMouseDown,
              .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if shiftDownAt != nil {
@@ -338,6 +415,102 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             handleFlagsChanged(event)
         default:
             break
+        }
+    }
+
+    // MARK: - Candidate window auto-calibration
+
+    /// Alphabetic key codes on a QWERTY layout (A-Z).
+    private static let alphaKeyCodes: Set<Int64> = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17,
+        31, 32, 34, 35, 37, 38, 40, 45, 46,
+    ]
+
+    /// Called on every keyDown to accumulate alphabetic key presses for
+    /// candidate window detection.  Both the CGEvent tap and the NSEvent global
+    /// monitor fire for the same physical keystroke, so we deduplicate by
+    /// ignoring events that arrive within a very short window of each other.
+    private var lastAlphaKeyNoteAt: CFAbsoluteTime = 0
+
+    private func noteAlphaKeyDown(keyCode: Int64) {
+        guard isTargetInputMethodSelected else {
+            pendingAlphaKeyCount = 0
+            candidateCheckTimer?.invalidate()
+            candidateCheckTimer = nil
+            return
+        }
+
+        guard Self.alphaKeyCodes.contains(keyCode) else {
+            return
+        }
+
+        // Deduplicate: if we just noted an alpha key within 20 ms, this is
+        // almost certainly the same physical keystroke arriving through the
+        // other event source.
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastAlphaKeyNoteAt > 0.02 else {
+            return
+        }
+        lastAlphaKeyNoteAt = now
+
+        pendingAlphaKeyCount += 1
+
+        // Schedule (or reschedule) a deferred check.  We wait a short moment
+        // because the candidate window needs time to appear after a keystroke.
+        candidateCheckTimer?.invalidate()
+        candidateCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in
+            self?.performCandidateWindowCheck()
+        }
+    }
+
+    /// Checks whether the target IME's candidate window is on-screen and uses
+    /// the result to auto-calibrate the tracked Chinese/English mode.
+    private func performCandidateWindowCheck() {
+        candidateCheckTimer = nil
+
+        let keysTyped = pendingAlphaKeyCount
+        pendingAlphaKeyCount = 0
+
+        guard isTargetInputMethodSelected else {
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
+            return
+        }
+
+        let visible = CandidateWindowMonitor.isCandidateWindowVisible(
+            bundleID: appConfig.targetInputMethodBundleID
+        )
+
+        if visible {
+            // Candidate window is showing → definitely Chinese mode.
+            if !targetModeKnown || !targetModeChinese {
+                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
+                targetModeChinese = true
+                targetModeKnown = true
+                UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+                lastAutoCalibrationAt = now
+                log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible keys=\(keysTyped)")
+                updateTitle()
+                rebuildMenu()
+            }
+        } else if keysTyped >= 2 {
+            // Multiple alphabetic keys typed without a candidate window → very
+            // likely English mode.  We require at least 2 keys to reduce false
+            // positives (the first key in Chinese mode may not yet show the
+            // panel if the user types slowly).
+            if !targetModeKnown || targetModeChinese {
+                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
+                targetModeChinese = false
+                targetModeKnown = true
+                UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+                lastAutoCalibrationAt = now
+                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window keys=\(keysTyped)")
+                updateTitle()
+                rebuildMenu()
+            }
         }
     }
 
@@ -388,6 +561,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func refreshInputSource() {
         let next = InputSourceReader.current()
         let changed = next.id != currentSource.id || next.inputModeID != currentSource.inputModeID || next.bundleID != currentSource.bundleID
+
+        if changed {
+            previousSourceBundleID = currentSource.bundleID
+        }
+
         currentSource = next
 
         if changed {
@@ -397,6 +575,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftSourceChanged = true
                 log("shift invalidated reason=source-changed")
             }
+
+            // --- Improvement: detect re-entry to the target IME ---
+            // When the user switches away from the target IME and later
+            // switches back, the IME may have reset its internal mode (most
+            // Chinese IMEs default to Chinese on re-activation).  Mark the
+            // tracked mode as unknown so the candidate-window auto-calibration
+            // or manual calibration can correct it.
+            if isTargetInputMethodSelected && !previousSourceBundleID.isEmpty && !isTargetInputMethod(InputSourceReader.Source(id: "", name: "", bundleID: previousSourceBundleID, inputModeID: "")) {
+                log("target IME re-entered from bundle=\(previousSourceBundleID)")
+                // Reset pending alpha keys so the candidate check starts fresh
+                pendingAlphaKeyCount = 0
+                candidateCheckTimer?.invalidate()
+                candidateCheckTimer = nil
+                markTargetModeUnknown(reason: "target IME re-entered after switching away")
+            }
+
             updateTitle()
             rebuildMenu()
         } else {
@@ -549,6 +743,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
 
+        // --- Improvement: debounce rapid shift toggles ---
+        // Doubao's internal ShiftKeyEventCoalescer swallows duplicate or very
+        // rapid Shift events.  If our last accepted toggle was too recent, the
+        // IME likely ignored this one as well, so we should skip it.
+        let gapSinceLastToggle = now - lastShiftToggleAt
+        guard gapSinceLastToggle >= minimumShiftToggleGap else {
+            log("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
+            return
+        }
+
         guard targetModeKnown else {
             log("shift observed source=\(source) reason=unknown-mode-needs-calibration")
             updateTitle()
@@ -558,6 +762,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         targetModeChinese.toggle()
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+        lastShiftToggleAt = now
         log("shift toggled source=\(source) mode=\(displayMode.detail)")
         updateTitle()
         rebuildMenu()
@@ -686,6 +891,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         update.isEnabled = !updateCheckInProgress
         menu.addItem(update)
 
+        let gitHub = NSMenuItem(title: "GitHub 主页", action: #selector(openGitHub), keyEquivalent: "")
+        gitHub.target = self
+        menu.addItem(gitHub)
+
+        let star = NSMenuItem(title: "⭐ 给个 Star", action: #selector(openGitHubStar), keyEquivalent: "")
+        star.target = self
+        menu.addItem(star)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -717,6 +930,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func openInputMonitoringSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openGitHub() {
+        NSWorkspace.shared.open(gitHubURL)
+    }
+
+    @objc private func openGitHubStar() {
+        NSWorkspace.shared.open(gitHubURL)
     }
 
     @objc private func toggleLaunchAtLogin() {

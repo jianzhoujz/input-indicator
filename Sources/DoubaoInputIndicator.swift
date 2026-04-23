@@ -245,6 +245,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.refreshInputSource()
+            self?.pollCandidateWindow()
         }
     }
 
@@ -420,6 +421,38 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     // MARK: - Candidate window auto-calibration
 
+    /// Called every 0.5s from the main timer.  Checks whether the target IME's
+    /// candidate window is visible and auto-calibrates accordingly.  This works
+    /// even without Input Monitoring permission (no keyDown events needed).
+    private func pollCandidateWindow() {
+        guard isTargetInputMethodSelected else {
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
+            return
+        }
+
+        let visible = CandidateWindowMonitor.isCandidateWindowVisible(
+            bundleID: appConfig.targetInputMethodBundleID
+        )
+
+        if visible {
+            // Candidate window is showing → definitely Chinese mode.
+            if !targetModeKnown || !targetModeChinese {
+                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
+                targetModeChinese = true
+                targetModeKnown = true
+                UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+                lastAutoCalibrationAt = now
+                log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible source=poll")
+                updateTitle()
+                rebuildMenu()
+            }
+        }
+    }
+
     /// Alphabetic key codes on a QWERTY layout (A-Z).
     private static let alphaKeyCodes: Set<Int64> = [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17,
@@ -465,6 +498,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     /// Checks whether the target IME's candidate window is on-screen and uses
     /// the result to auto-calibrate the tracked Chinese/English mode.
+    /// This path is triggered by keyDown events (requires Input Monitoring)
+    /// and can additionally detect English mode via the absence of candidates.
     private func performCandidateWindowCheck() {
         candidateCheckTimer = nil
 
@@ -492,7 +527,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 targetModeKnown = true
                 UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
                 lastAutoCalibrationAt = now
-                log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible keys=\(keysTyped)")
+                log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible source=keydown keys=\(keysTyped)")
                 updateTitle()
                 rebuildMenu()
             }
@@ -507,7 +542,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 targetModeKnown = true
                 UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
                 lastAutoCalibrationAt = now
-                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window keys=\(keysTyped)")
+                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window source=keydown keys=\(keysTyped)")
                 updateTitle()
                 rebuildMenu()
             }

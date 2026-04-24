@@ -632,11 +632,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastAlphaKeyNoteAt: CFAbsoluteTime = 0
 
     private func noteAlphaKeyDown(keyCode: Int64) {
-        guard isTargetInputMethodSelected else {
-            pendingAlphaKeyCount = 0
-            candidateCheckTimer?.invalidate()
-            candidateCheckTimer = nil
-            return
+        if !isTargetInputMethodSelected {
+            // The cached currentSource may be stale (updated every 0.3 s by
+            // the timer).  When the user has just switched to the target IME
+            // and starts typing immediately, the first keystrokes would
+            // otherwise be silently discarded.  Do a one-off live check here
+            // so we don't miss those early keys.
+            refreshInputSource()
+            guard isTargetInputMethodSelected else {
+                pendingAlphaKeyCount = 0
+                candidateCheckTimer?.invalidate()
+                candidateCheckTimer = nil
+                return
+            }
         }
 
         guard Self.alphaKeyCodes.contains(keyCode) else {
@@ -998,6 +1006,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         targetModeKnown = false
         UserDefaults.standard.removeObject(forKey: appConfig.modeStateKey)
+        // Clear auto-calibration cooldown so that candidate-window detection
+        // can kick in immediately once the user starts typing.
+        lastAutoCalibrationAt = 0
         log("mode marked unknown reason=\(reason)")
         updateTitle()
         rebuildMenu()

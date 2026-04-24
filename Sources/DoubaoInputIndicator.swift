@@ -1114,6 +1114,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         menu.addItem(.separator())
 
+        let appNameItem = NSMenuItem(title: appConfig.displayName, action: nil, keyEquivalent: "")
+        appNameItem.isEnabled = false
+        menu.addItem(appNameItem)
+
+        let appPath = Bundle.main.bundlePath
+        let pathDisplay: String
+        if appPath.hasPrefix("/Applications") {
+            pathDisplay = "安装位置：/Applications"
+        } else if appPath.hasPrefix(NSHomeDirectory() + "/Applications") {
+            pathDisplay = "安装位置：~/Applications"
+        } else {
+            pathDisplay = "路径：\(appPath)"
+        }
+        let pathItem = NSMenuItem(title: pathDisplay, action: nil, keyEquivalent: "")
+        pathItem.isEnabled = false
+        menu.addItem(pathItem)
+
         let version = NSMenuItem(title: "版本 \(appVersion)", action: nil, keyEquivalent: "")
         version.isEnabled = false
         menu.addItem(version)

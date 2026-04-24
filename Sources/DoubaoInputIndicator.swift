@@ -17,7 +17,7 @@ private enum DisplayMode {
         case .english:
             return "🇺🇸"
         case .unknown:
-            return "?"
+            return "🫥"
         case .nonTarget:
             return "🤐"
         }
@@ -1033,7 +1033,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func updateTitle() {
-        let title = needsInputMonitoringPermission ? "⚠️" : displayMode.title
+        let title = needsInputMonitoringPermission ? "🥶" : displayMode.title
 
         statusItem.button?.title = title
         statusItem.button?.toolTip = tooltipText()
@@ -1055,7 +1055,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let sourceName = currentSource.name.isEmpty ? currentSource.id : currentSource.name
         if needsInputMonitoringPermission {
-            let permission = NSMenuItem(title: "⚠️ 输入监控权限未完成", action: nil, keyEquivalent: "")
+            let permission = NSMenuItem(title: "🥶 输入监控权限未完成", action: nil, keyEquivalent: "")
             permission.isEnabled = false
             menu.addItem(permission)
 

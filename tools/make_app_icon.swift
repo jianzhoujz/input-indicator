@@ -40,43 +40,103 @@ func drawIcon(pixels: Int) -> NSImage {
     NSColor.clear.setFill()
     rect.fill()
 
-    let cornerRadius = CGFloat(pixels) * 0.22
-    let background = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
+    let tileRect = rect.insetBy(dx: CGFloat(pixels) * 0.055, dy: CGFloat(pixels) * 0.055)
+    let cornerRadius = CGFloat(pixels) * 0.215
+    let tile = NSBezierPath(roundedRect: tileRect, xRadius: cornerRadius, yRadius: cornerRadius)
+
+    NSGraphicsContext.saveGraphicsState()
+    let tileShadow = NSShadow()
+    tileShadow.shadowBlurRadius = CGFloat(pixels) * 0.040
+    tileShadow.shadowOffset = NSSize(width: 0, height: -CGFloat(pixels) * 0.018)
+    tileShadow.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.20)
+    tileShadow.set()
 
     let gradient = NSGradient(colors: [
-        NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.16, alpha: 1),
-        NSColor(calibratedRed: 0.20, green: 0.24, blue: 0.30, alpha: 1)
+        NSColor(calibratedRed: 0.12, green: 0.54, blue: 0.94, alpha: 1),
+        NSColor(calibratedRed: 0.12, green: 0.76, blue: 0.86, alpha: 1)
     ])
-    gradient?.draw(in: background, angle: -35)
+    gradient?.draw(in: tile, angle: -28)
+    NSGraphicsContext.restoreGraphicsState()
 
-    NSColor(calibratedWhite: 1, alpha: 0.10).setStroke()
-    background.lineWidth = max(1, CGFloat(pixels) * 0.012)
-    background.stroke()
+    NSGraphicsContext.saveGraphicsState()
+    tile.addClip()
 
-    let shadow = NSShadow()
-    shadow.shadowBlurRadius = CGFloat(pixels) * 0.035
-    shadow.shadowOffset = NSSize(width: 0, height: -CGFloat(pixels) * 0.015)
-    shadow.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.35)
-
-    let font = NSFont.systemFont(ofSize: CGFloat(pixels) * 0.58, weight: .regular)
-    let paragraph = NSMutableParagraphStyle()
-    paragraph.alignment = .center
-
-    let attributes: [NSAttributedString.Key: Any] = [
-        .font: font,
-        .paragraphStyle: paragraph,
-        .shadow: shadow
-    ]
-
-    let attributed = NSAttributedString(string: emoji, attributes: attributes)
-    let textSize = attributed.size()
-    let textRect = NSRect(
-        x: (size.width - textSize.width) / 2,
-        y: (size.height - textSize.height) / 2 + CGFloat(pixels) * 0.012,
-        width: textSize.width,
-        height: textSize.height
+    let faceRect = NSRect(
+        x: CGFloat(pixels) * 0.205,
+        y: CGFloat(pixels) * 0.185,
+        width: CGFloat(pixels) * 0.590,
+        height: CGFloat(pixels) * 0.590
     )
-    attributed.draw(in: textRect)
+    let face = NSBezierPath(ovalIn: faceRect)
+
+    NSGraphicsContext.saveGraphicsState()
+    let faceShadow = NSShadow()
+    faceShadow.shadowBlurRadius = CGFloat(pixels) * 0.030
+    faceShadow.shadowOffset = NSSize(width: 0, height: -CGFloat(pixels) * 0.012)
+    faceShadow.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.18)
+    faceShadow.set()
+
+    let faceGradient = NSGradient(colors: [
+        NSColor(calibratedRed: 1.00, green: 0.86, blue: 0.26, alpha: 1),
+        NSColor(calibratedRed: 0.96, green: 0.63, blue: 0.10, alpha: 1)
+    ])
+    faceGradient?.draw(in: face, angle: -90)
+    NSGraphicsContext.restoreGraphicsState()
+
+    NSColor(calibratedWhite: 1, alpha: 0.24).setStroke()
+    face.lineWidth = max(1, CGFloat(pixels) * 0.012)
+    face.stroke()
+
+    let featureColor = NSColor(calibratedRed: 0.28, green: 0.17, blue: 0.08, alpha: 0.95)
+    featureColor.setFill()
+
+    let eyeWidth = CGFloat(pixels) * 0.062
+    let eyeHeight = CGFloat(pixels) * 0.100
+    let eyeY = CGFloat(pixels) * 0.535
+    NSBezierPath(ovalIn: NSRect(x: CGFloat(pixels) * 0.365, y: eyeY, width: eyeWidth, height: eyeHeight)).fill()
+    NSBezierPath(ovalIn: NSRect(x: CGFloat(pixels) * 0.573, y: eyeY, width: eyeWidth, height: eyeHeight)).fill()
+
+    let zipperBase = NSRect(
+        x: CGFloat(pixels) * 0.330,
+        y: CGFloat(pixels) * 0.405,
+        width: CGFloat(pixels) * 0.340,
+        height: CGFloat(pixels) * 0.044
+    )
+    NSColor(calibratedRed: 0.34, green: 0.20, blue: 0.08, alpha: 0.98).setFill()
+    NSBezierPath(roundedRect: zipperBase, xRadius: CGFloat(pixels) * 0.020, yRadius: CGFloat(pixels) * 0.020).fill()
+
+    NSColor(calibratedWhite: 0.96, alpha: 1).setFill()
+    let toothCount = 7
+    let toothWidth = CGFloat(pixels) * 0.026
+    let toothHeight = CGFloat(pixels) * 0.030
+    let toothGap = (zipperBase.width - CGFloat(toothCount) * toothWidth) / CGFloat(toothCount + 1)
+    for index in 0..<toothCount {
+        let x = zipperBase.minX + toothGap + CGFloat(index) * (toothWidth + toothGap)
+        let y = zipperBase.midY - toothHeight / 2
+        NSBezierPath(roundedRect: NSRect(x: x, y: y, width: toothWidth, height: toothHeight), xRadius: toothWidth * 0.18, yRadius: toothWidth * 0.18).fill()
+    }
+
+    NSColor(calibratedWhite: 0.90, alpha: 1).setFill()
+    let pullRect = NSRect(
+        x: zipperBase.maxX - CGFloat(pixels) * 0.018,
+        y: zipperBase.minY - CGFloat(pixels) * 0.020,
+        width: CGFloat(pixels) * 0.048,
+        height: CGFloat(pixels) * 0.078
+    )
+    NSBezierPath(roundedRect: pullRect, xRadius: CGFloat(pixels) * 0.014, yRadius: CGFloat(pixels) * 0.014).fill()
+    NSColor(calibratedRed: 0.42, green: 0.42, blue: 0.44, alpha: 1).setStroke()
+    let pullHole = NSBezierPath(ovalIn: pullRect.insetBy(dx: CGFloat(pixels) * 0.012, dy: CGFloat(pixels) * 0.020))
+    pullHole.lineWidth = max(1, CGFloat(pixels) * 0.004)
+    pullHole.stroke()
+
+    NSGraphicsContext.restoreGraphicsState()
+
+    if emoji != "🤐" {
+        let font = NSFont.systemFont(ofSize: CGFloat(pixels) * 0.15, weight: .regular)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let attributed = NSAttributedString(string: emoji, attributes: attributes)
+        attributed.draw(at: NSPoint(x: CGFloat(pixels) * 0.74, y: CGFloat(pixels) * 0.14))
+    }
 
     return image
 }

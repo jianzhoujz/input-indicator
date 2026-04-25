@@ -20,14 +20,26 @@ case "$VARIANT" in
 esac
 
 SRC_APP="$ROOT/build/$APP_NAME.app"
-DEST_APP="$HOME/Applications/$APP_NAME.app"
+DEST_APP="/Applications/$APP_NAME.app"
+LEGACY_USER_APP="$HOME/Applications/$APP_NAME.app"
+BUILD_APP="$ROOT/build/$APP_NAME.app"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_ID.plist"
 
+stop_running_app() {
+  launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+  pkill -f "$DEST_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 || true
+  pkill -f "$LEGACY_USER_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 || true
+  pkill -f "$BUILD_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 || true
+}
+
+stop_running_app
 "$ROOT/build.sh" "$VARIANT" >/dev/null
 
-mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents"
-pkill -f "$DEST_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 || true
+mkdir -p "$HOME/Library/LaunchAgents"
+stop_running_app
 rm -rf "$DEST_APP"
+rm -rf "$LEGACY_USER_APP"
 cp -R "$SRC_APP" "$DEST_APP"
 
 cat > "$AGENT_PLIST" <<PLIST
@@ -51,7 +63,7 @@ cat > "$AGENT_PLIST" <<PLIST
 </plist>
 PLIST
 
-launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
+stop_running_app
 launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" >/dev/null
 launchctl enable "gui/$(id -u)/$AGENT_ID" >/dev/null 2>&1 || true
 

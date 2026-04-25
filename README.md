@@ -19,8 +19,9 @@
 | --- | --- |
 | `🇨🇳` | 中文模式 |
 | `🇺🇸` | 英文模式 |
-| `?` | 中英文状态未知，需要在菜单中校准 |
-| `⚠️` | 输入监控权限未开启或未确认 |
+| `🫥` | 中英文状态未知，需要校准或等待自动校准 |
+| `🤐` | 当前不是目标输入法 |
+| `🥶` | 输入监控权限未开启或未确认 |
 
 当前提供两个版本：
 
@@ -62,10 +63,10 @@ brew uninstall --cask wetype-input-indicator
 
 如果不使用 Homebrew，可以从 [GitHub Releases](https://github.com/jianzhoujz/input-indicator/releases) 下载对应压缩包：
 
-- `DoubaoInputIndicator-版本号.zip`
-- `WeTypeInputIndicator-版本号.zip`
+- `DoubaoInputIndicator-版本号.dmg`
+- `WeTypeInputIndicator-版本号.dmg`
 
-解压后，将 `.app` 拖到 `/Applications` 或 `~/Applications`，然后启动应用。
+打开 `.dmg` 后，将应用拖到窗口里的 `Applications` 快捷方式，然后从 `/Applications` 启动应用。
 
 ## 首次启动
 
@@ -91,8 +92,6 @@ xattr -dr com.apple.quarantine /Applications/DoubaoInputIndicator.app
 xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 ```
 
-如果你安装在 `~/Applications`，请把命令里的 `/Applications` 改成 `~/Applications`。
-
 ## 使用说明
 
 启动后，应用会出现在 macOS 菜单栏。点击菜单栏图标可以打开菜单。
@@ -104,12 +103,17 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 - `检查更新...`：检查 GitHub Releases 中的新版本
 - `退出`：退出应用
 
+应用会通过候选词窗口辅助校准状态：
+
+- 目标输入法出现候选词窗口时，自动校准为中文。
+- 已授权输入监控时，连续输入字母但没有候选词窗口时，自动校准为英文。
+
 如果显示状态和实际输入状态不一致，可以在菜单中手动校准：
 
 - `校准为中文`
 - `校准为英文`
 
-如果应用检测到可能漏掉了一次 Shift 切换，例如启动瞬间按了 Shift，或者 Shift 按下到松开期间输入源发生变化，菜单栏会显示 `?`。这种情况下请用菜单里的校准项重新同步。
+如果应用检测到可能漏掉了一次 Shift 切换，例如启动瞬间按了 Shift，或者 Shift 按下到松开期间输入源发生变化，菜单栏会显示 `🫥`。这种情况下可以使用菜单里的校准项重新同步，或继续输入让候选词窗口自动校准。
 
 ### 输入监控权限
 
@@ -125,6 +129,44 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 - `WeTypeInputIndicator.app`
 
 授权后请退出并重新启动应用。
+
+没有输入监控权限时，应用仍可通过候选词窗口自动校准为中文，但无法通过按键事件判断“连续输入字母但没有候选词”的英文状态。
+
+## 开发构建
+
+本仓库提供简单的构建和安装脚本：
+
+```bash
+./build.sh doubao
+./build.sh wetype
+```
+
+`build.sh` 只生成 `build/<AppName>.app`，不直接运行。
+
+生成面向用户分发的 DMG：
+
+```bash
+./package-dmg.sh doubao
+./package-dmg.sh wetype
+```
+
+DMG 会输出到 `dist/`，窗口中包含应用、`Applications` 快捷方式和拖拽安装提示背景图。
+
+开发调试时使用：
+
+```bash
+./install.sh doubao
+./install.sh wetype
+```
+
+`install.sh` 会先停止正在运行的同名进程，然后重新构建、替换 `/Applications/<AppName>.app`，并通过 LaunchAgent 从 `/Applications` 启动。脚本也会清理旧的 `~/Applications/<AppName>.app`，避免运行到用户目录或 `build/` 目录里的旧产物。
+
+卸载开发安装：
+
+```bash
+./uninstall.sh doubao
+./uninstall.sh wetype
+```
 
 ### 微信输入法设置
 

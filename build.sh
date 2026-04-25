@@ -30,6 +30,8 @@ esac
 APP="$ROOT/build/$APP_NAME.app"
 BIN="$APP/Contents/MacOS/$APP_NAME"
 RESOURCES="$APP/Contents/Resources"
+SOURCE_RESOURCES="$ROOT/Resources"
+APP_ICON="$SOURCE_RESOURCES/AppIcon.icns"
 
 # Clean previous build artifacts
 rm -rf "$ROOT/build"
@@ -72,10 +74,20 @@ compile_slice x86_64
 lipo -create "${SLICE_BINS[@]}" -output "$BIN"
 chmod +x "$BIN"
 
-ICONSET="$RESOURCES/AppIcon.iconset"
-swift "$ROOT/tools/make_app_icon.swift" "$ICONSET" "⌨️"
-iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
-rm -rf "$ICONSET"
+if [[ "${REGENERATE_APP_ICON:-0}" == "1" ]]; then
+  mkdir -p "$SOURCE_RESOURCES"
+  ICONSET="$ROOT/build/AppIcon.iconset"
+  swift "$ROOT/tools/make_app_icon.swift" "$ICONSET" "🤐"
+  iconutil -c icns "$ICONSET" -o "$APP_ICON"
+  rm -rf "$ICONSET"
+fi
+
+if [[ ! -f "$APP_ICON" ]]; then
+  echo "Missing $APP_ICON. Run REGENERATE_APP_ICON=1 $0 $VARIANT to create it." >&2
+  exit 1
+fi
+
+cp "$APP_ICON" "$RESOURCES/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

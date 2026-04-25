@@ -52,6 +52,22 @@ brew install --cask doubao-input-indicator
 brew install --cask wetype-input-indicator
 ```
 
+### 更新
+
+豆包输入法指示器：
+
+```bash
+brew update
+brew upgrade --cask doubao-input-indicator
+```
+
+微信输入法指示器：
+
+```bash
+brew update
+brew upgrade --cask wetype-input-indicator
+```
+
 ### 卸载
 
 ```bash

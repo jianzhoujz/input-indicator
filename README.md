@@ -119,10 +119,12 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 - `检查更新...`：检查 GitHub Releases 中的新版本
 - `退出`：退出应用
 
-应用会通过候选词窗口辅助校准状态：
+应用启动时状态为「未知」（`🫥`），通过以下方式自动校准：
 
-- 目标输入法出现候选词窗口时，自动校准为中文。
-- 已授权输入监控时，连续输入字母但没有候选词窗口时，自动校准为英文。
+- **Accessibility 模式指示器**：按 Shift 切换中英文时，豆包输入法会弹出一个「中」/「英」提示窗口。应用通过 Accessibility API 读取该窗口文字，快速准确地校准模式。这是最可靠的校准方式。
+- **候选词窗口检测**：目标输入法出现候选词窗口时，自动校准为中文。作为 Accessibility 方式的兜底补充。
+- **无候选词校准**：已授权输入监控时，连续输入字母但没有候选词窗口时，自动校准为英文。
+- 候选词窗口检测采用自适应轮询：活跃输入时快速扫描，空闲时自动降频以节省 CPU。
 
 如果显示状态和实际输入状态不一致，可以在菜单中手动校准：
 
@@ -146,7 +148,25 @@ xattr -dr com.apple.quarantine /Applications/WeTypeInputIndicator.app
 
 授权后请退出并重新启动应用。
 
-没有输入监控权限时，应用仍可通过候选词窗口自动校准为中文，但无法通过按键事件判断“连续输入字母但没有候选词”的英文状态。
+��有输入监控权限时，应用仍可通过候选词窗口自动校准为中文，也可通过 Shift 后的 Accessibility 模式指示器读取来校准，但无法通过按键事件判断"连续输入字母但没有候选词"的英文状态。
+
+菜单中的 Shift 监听状态会显示当前权限信息：已启用或等待授权。
+
+### 调试模式
+
+启动时传入参数可开启详细事件日志：
+
+```bash
+defaults write local.doubao-input-indicator verboseEventLogging -bool true
+```
+
+开启后，日志文件会记录窗口扫描详情等额外信息，便于定位状态机问题。关闭：
+
+```bash
+defaults delete local.doubao-input-indicator verboseEventLogging
+```
+
+日志文件位于 `~/Library/Logs/DoubaoInputIndicator.log`（或 `WeTypeInputIndicator.log`），超过 1 MB 自动轮转。可通过菜单中的「日志」打开日志目录，「清空日志」删除所有日志文件。
 
 ## 开发构建
 

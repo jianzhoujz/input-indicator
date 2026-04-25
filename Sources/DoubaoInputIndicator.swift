@@ -140,9 +140,11 @@ private final class CandidateWindowMonitor {
     private static let candidateLayerThreshold = 2_147_483_000
 
     /// Minimum window height (in points) to be considered a candidate panel.
-    /// Some Doubao candidate panels are a single row around 32 pt high, so a
-    /// width check is also used below to support narrow single-row panels.
+    /// Full multi-row candidate panels are typically 50+ pt tall.
     private static let minimumCandidateWindowHeight = 40
+    /// Doubao sometimes shows a single-row candidate panel at ~32 pt height
+    /// with a width of 400+ pt.  We use a combined height+width check to
+    /// distinguish these from tiny persistent toolbar/tooltip windows.
     private static let minimumSingleRowCandidateWindowHeight = 24
     private static let minimumSingleRowCandidateWindowWidth = 100
 
@@ -157,23 +159,30 @@ private final class CandidateWindowMonitor {
     struct WindowSnapshot {
         /// Whether a tall candidate panel is visible (Chinese input active).
         let candidateVisible: Bool
+        /// Window IDs of small indicator-sized windows (the "中"/"英" tooltip).
+        let indicatorWIDs: Set<CGWindowID>
     }
 
     /// Scans on-screen windows owned by the target IME and returns a snapshot
-    /// containing candidate panel visibility.
-    static func snapshot(bundleID: String) -> WindowSnapshot {
-        guard let pid = findIMEProcessID(bundleID) else {
-            return WindowSnapshot(candidateVisible: false)
+    /// containing both candidate panel visibility and indicator window IDs.
+    static func snapshot(bundleID: String,
+                         indicatorMinSize: Int,
+                         indicatorMaxSize: Int,
+                         logHandler: ((String) -> Void)? = nil) -> WindowSnapshot {
+        guard let pid = cachedFindIMEProcessID(bundleID) else {
+            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [])
         }
 
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return WindowSnapshot(candidateVisible: false)
+            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [])
         }
 
         var candidateVisible = false
+        var indicatorWIDs = Set<CGWindowID>()
+        var scannedCount = 0
 
         for info in windowList {
             guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
@@ -190,20 +199,118 @@ private final class CandidateWindowMonitor {
                 continue
             }
 
+            scannedCount += 1
+            logHandler?("window layer=\(layer) w=\(width) h=\(height)")
+
             if height >= minimumCandidateWindowHeight
                 || (height >= minimumSingleRowCandidateWindowHeight
                     && width >= minimumSingleRowCandidateWindowWidth) {
                 candidateVisible = true
             }
+
+            if width >= indicatorMinSize && width <= indicatorMaxSize
+                && height >= indicatorMinSize && height <= indicatorMaxSize {
+                let wid = info[kCGWindowNumber as String] as? CGWindowID ?? 0
+                if wid != 0 {
+                    indicatorWIDs.insert(wid)
+                }
+            }
         }
 
-        return WindowSnapshot(candidateVisible: candidateVisible)
+        if scannedCount == 0 {
+            logHandler?("snapshot: no high-layer windows found for pid=\(pid)")
+        }
+
+        return WindowSnapshot(candidateVisible: candidateVisible,
+                              indicatorWIDs: indicatorWIDs)
     }
 
     /// Returns `true` when the target IME currently has an on-screen candidate
     /// window, indicating Chinese input mode is active.
     static func isCandidateWindowVisible(bundleID: String) -> Bool {
-        snapshot(bundleID: bundleID).candidateVisible
+        snapshot(bundleID: bundleID, indicatorMinSize: 0, indicatorMaxSize: 0).candidateVisible
+    }
+
+    // MARK: - PID cache
+
+    private static var cachedPID: pid_t?
+    private static var cachedPIDBundleID: String = ""
+    private static var cachedPIDAt: CFAbsoluteTime = 0
+    private static let pidCacheTTL: CFAbsoluteTime = 5.0
+
+    /// Find the IME process ID, using a short-lived cache to avoid repeated
+    /// linear scans of `runningApplications`.
+    static func cachedFindIMEProcessID(_ bundleID: String) -> pid_t? {
+        let now = CFAbsoluteTimeGetCurrent()
+        if bundleID == cachedPIDBundleID,
+           let pid = cachedPID,
+           now - cachedPIDAt < pidCacheTTL {
+            return pid
+        }
+        let pid = findIMEProcessID(bundleID)
+        cachedPID = pid
+        cachedPIDBundleID = bundleID
+        cachedPIDAt = now
+        return pid
+    }
+
+    // MARK: - Mode indicator reading via Accessibility API
+
+    /// Recognized mode from the IME's mode-indicator tooltip.
+    enum RecognizedMode {
+        case chinese
+        case english
+        case unrecognized
+    }
+
+    /// Use the Accessibility API to read text content from the IME process's
+    /// UI elements.  The small "中"/"英" tooltip shown on mode switch is
+    /// typically exposed as a child element with a value or title attribute.
+    /// This requires Accessibility permission but NOT Screen Recording.
+    static func recognizeModeFromAccessibility(pid: pid_t) -> (RecognizedMode, String) {
+        let app = AXUIElementCreateApplication(pid)
+
+        // Try to read all children of the application element.  IME overlay
+        // windows (candidate panel, mode indicator) may appear as children
+        // even if they are not reported via kAXWindowsAttribute.
+        var texts = [String]()
+        collectTexts(from: app, into: &texts, depth: 0, maxDepth: 5)
+
+        for text in texts {
+            if text.contains("中") { return (.chinese, text) }
+            if text.contains("英") { return (.english, text) }
+        }
+
+        return (.unrecognized, texts.joined(separator: "|"))
+    }
+
+    /// Recursively collect text content (title, value, description) from an
+    /// AXUIElement tree.
+    private static func collectTexts(from element: AXUIElement,
+                                     into texts: inout [String],
+                                     depth: Int,
+                                     maxDepth: Int) {
+        guard depth <= maxDepth else { return }
+
+        // Try common text attributes
+        for attr in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] as [String] {
+            var ref: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, attr as CFString, &ref) == .success,
+               let str = ref as? String, !str.isEmpty {
+                texts.append(str)
+            }
+        }
+
+        // Recurse into children
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            return
+        }
+
+        for child in children {
+            collectTexts(from: child, into: &texts, depth: depth + 1, maxDepth: maxDepth)
+        }
     }
 }
 
@@ -224,8 +331,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var logDirectoryCreated = false
 
     private var currentSource = InputSourceReader.Source(id: "", name: "", bundleID: "", inputModeID: "")
-    private var targetModeChinese = UserDefaults.standard.object(forKey: appConfig.modeStateKey) as? Bool ?? true
-    private var targetModeKnown = UserDefaults.standard.object(forKey: appConfig.modeStateKey) is Bool
+    // Always start in unknown mode on launch.  The persisted state may be
+    // stale because the user could have toggled the IME while this app was
+    // not running.  Auto-calibration will correct it quickly once the user
+    // starts typing or a candidate window appears.
+    private var targetModeChinese = true
+    private var targetModeKnown = false
     private var listenAccessGranted = false
     private var observedInputEvent = false
     private var eventTapActive = false
@@ -247,10 +358,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// How many alphabetic key-downs we have seen since the last candidate
     /// window check while the target IME is active.
     private var pendingAlphaKeyCount = 0
-    /// How many alphabetic key-downs have been followed by no candidate
-    /// window in consecutive checks. This must span checks because normal
-    /// typing can be slower than the deferred candidate check interval.
-    private var consecutiveNoCandidateAlphaKeyCount = 0
     /// Timestamp of the last successful auto-calibration to throttle checks.
     private var lastAutoCalibrationAt: CFAbsoluteTime = 0
     /// Minimum interval between auto-calibrations (seconds).
@@ -267,6 +374,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Timestamp of the last accepted shift toggle.
     private var lastShiftToggleAt: CFAbsoluteTime = 0
     private let maximumLogFileSize: UInt64 = 1_048_576
+    /// Timestamp of the last key activity (alpha key or shift) for adaptive
+    /// poll throttling.
+    private var lastKeyActivityAt: CFAbsoluteTime = 0
 
     private var logDirectoryURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs", isDirectory: true)
@@ -279,6 +389,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var rotatedLogFileURL: URL {
         logFileURL.appendingPathExtension("old")
     }
+
+    // --- Mode indicator window detection ---
+    /// Window IDs of small (mode indicator) windows seen in the previous poll.
+    /// When new IDs appear, it signals a mode toggle by the IME.
+    private var knownIndicatorWIDs = Set<CGWindowID>()
+    /// Size constraints for the mode indicator window ("中"/"英" tooltip).
+    /// Doubao shows a ~25×28 pt black tooltip on each mode switch.
+    private static let indicatorMaxSize = 50
+    private static let indicatorMinSize = 15
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -294,6 +413,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         rebuildMenu()
         refreshInputSource()
+        requestAccessibilityIfNeeded()
         requestListenAccessIfNeeded()
         installEventTap()
         if !eventTapActive || !listenAccessGranted {
@@ -323,6 +443,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func menuDidClose(_ menu: NSMenu) {
         menuIsOpen = false
+    }
+
+    private func requestAccessibilityIfNeeded() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        log("accessibility trusted=\(trusted)")
     }
 
     private func requestListenAccessIfNeeded() {
@@ -394,7 +520,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         CGEvent.tapEnable(tap: eventTap, enable: true)
         eventTapActive = true
         log("event tap active")
-        removeGlobalMonitor()
         rebuildMenu()
         updateTitle()
     }
@@ -439,9 +564,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard !shouldIgnoreEventDuringStartup(source: "nsevent", keyCode: keyCode) else {
             return
         }
+
         switch event.type {
         case .keyDown:
-            noteInputEvent(source: "nsevent")
+            noteInputEvent()
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
@@ -471,9 +597,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard !shouldIgnoreEventDuringStartup(source: "cgevent", keyCode: keyCode) else {
             return
         }
+
         switch type {
         case .keyDown:
-            noteInputEvent(source: "cgevent")
+            noteInputEvent()
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
@@ -492,20 +619,79 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     // MARK: - Candidate window auto-calibration
 
-    /// Called every 0.3s from the main timer.  Detects the IME's candidate
-    /// panel to auto-calibrate Chinese mode state.
+    /// Called every 0.3s from the main timer.  Detects the IME's mode-indicator
+    /// tooltip ("中"/"英") and candidate panel to auto-calibrate mode state.
     private func pollCandidateWindow() {
         guard isTargetInputMethodSelected else {
+            knownIndicatorWIDs.removeAll()
             return
         }
 
         let now = CFAbsoluteTimeGetCurrent()
 
-        guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
+        // Adaptive polling: skip expensive window scan when idle and mode is
+        // already known.  Always scan when mode is unknown (needs calibration).
+        let idleThreshold: CFAbsoluteTime = 3.0
+        if targetModeKnown && (now - lastKeyActivityAt) >= idleThreshold {
             return
         }
 
-        let snap = CandidateWindowMonitor.snapshot(bundleID: appConfig.targetInputMethodBundleID)
+        let snap = CandidateWindowMonitor.snapshot(
+            bundleID: appConfig.targetInputMethodBundleID,
+            indicatorMinSize: Self.indicatorMinSize,
+            indicatorMaxSize: Self.indicatorMaxSize,
+            logHandler: !targetModeKnown ? { [weak self] msg in self?.logVerbose(msg) } : nil
+        )
+
+        // --- Mode indicator window ("中"/"英" tooltip) detection ---
+        let newWIDs = snap.indicatorWIDs.subtracting(knownIndicatorWIDs)
+        knownIndicatorWIDs = snap.indicatorWIDs
+
+        if !newWIDs.isEmpty {
+            // A new indicator window appeared → the IME just changed modes.
+            // Use Accessibility API to read the mode text from the IME process.
+            guard let pid = CandidateWindowMonitor.findIMEProcessID(appConfig.targetInputMethodBundleID) else {
+                return
+            }
+            let (recognized, detail) = CandidateWindowMonitor.recognizeModeFromAccessibility(pid: pid)
+            switch recognized {
+            case .chinese:
+                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
+                if !targetModeKnown || !targetModeChinese {
+                    targetModeChinese = true
+                    targetModeKnown = true
+                    UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+                    log("auto-calibrate mode=中文 old=\(oldMode) trigger=indicator-ax text=\(detail)")
+                    updateTitle()
+                    rebuildMenuIfOpen()
+                } else {
+                    log("indicator-ax confirmed mode=中文 text=\(detail)")
+                }
+                lastAutoCalibrationAt = now
+                return
+            case .english:
+                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
+                if !targetModeKnown || targetModeChinese {
+                    targetModeChinese = false
+                    targetModeKnown = true
+                    UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
+                    log("auto-calibrate mode=英文 old=\(oldMode) trigger=indicator-ax text=\(detail)")
+                    updateTitle()
+                    rebuildMenuIfOpen()
+                } else {
+                    log("indicator-ax confirmed mode=英文 text=\(detail)")
+                }
+                lastAutoCalibrationAt = now
+                return
+            case .unrecognized:
+                log("indicator-ax result=unrecognized detail=\(detail)")
+            }
+        }
+
+        // --- Candidate window (tall panel) detection ---
+        guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
+            return
+        }
 
         if snap.candidateVisible {
             if !targetModeKnown || !targetModeChinese {
@@ -534,6 +720,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastAlphaKeyNoteAt: CFAbsoluteTime = 0
 
     private func noteAlphaKeyDown(keyCode: Int64) {
+        // Track key activity for adaptive poll throttling
+        lastKeyActivityAt = CFAbsoluteTimeGetCurrent()
+
         if !isTargetInputMethodSelected {
             // The cached currentSource may be stale (updated every 0.3 s by
             // the timer).  When the user has just switched to the target IME
@@ -543,7 +732,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             refreshInputSource()
             guard isTargetInputMethodSelected else {
                 pendingAlphaKeyCount = 0
-                consecutiveNoCandidateAlphaKeyCount = 0
                 candidateCheckTimer?.invalidate()
                 candidateCheckTimer = nil
                 return
@@ -580,25 +768,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func performCandidateWindowCheck() {
         candidateCheckTimer = nil
 
-        let keysTyped = pendingAlphaKeyCount
-        pendingAlphaKeyCount = 0
-
         guard isTargetInputMethodSelected else {
-            consecutiveNoCandidateAlphaKeyCount = 0
+            pendingAlphaKeyCount = 0
             return
         }
 
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
+            // Don't discard pending key evidence during cooldown.
+            // Schedule a deferred check for when cooldown expires.
+            let remaining = autoCalibrationCooldown - (now - lastAutoCalibrationAt) + 0.05
+            candidateCheckTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
+                self?.performCandidateWindowCheck()
+            }
             return
         }
 
-        let visible = CandidateWindowMonitor.isCandidateWindowVisible(
-            bundleID: appConfig.targetInputMethodBundleID
-        )
+        let keysTyped = pendingAlphaKeyCount
+        pendingAlphaKeyCount = 0
+
+        let visible = CandidateWindowMonitor.snapshot(
+            bundleID: appConfig.targetInputMethodBundleID,
+            indicatorMinSize: 0,
+            indicatorMaxSize: 0
+        ).candidateVisible
 
         if visible {
-            consecutiveNoCandidateAlphaKeyCount = 0
             // Candidate window is showing → definitely Chinese mode.
             if !targetModeKnown || !targetModeChinese {
                 let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
@@ -611,30 +806,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 rebuildMenuIfOpen()
             }
         } else {
-            consecutiveNoCandidateAlphaKeyCount += keysTyped
-            if !targetModeKnown {
-                log("candidate-check no-candidate keys=\(keysTyped) consecutiveKeys=\(consecutiveNoCandidateAlphaKeyCount)")
-            }
-
-            guard consecutiveNoCandidateAlphaKeyCount >= 2 else {
-                return
-            }
-
+            log("candidate-check no-candidate keys=\(keysTyped)")
             // Multiple alphabetic keys typed without a candidate window → very
             // likely English mode.  We require at least 2 keys to reduce false
             // positives (the first key in Chinese mode may not yet show the
             // panel if the user types slowly).
-            if !targetModeKnown || targetModeChinese {
+            if keysTyped >= 2, !targetModeKnown || targetModeChinese {
                 let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
                 targetModeChinese = false
                 targetModeKnown = true
                 UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
                 lastAutoCalibrationAt = now
-                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window source=keydown keys=\(consecutiveNoCandidateAlphaKeyCount)")
+                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window source=keydown keys=\(keysTyped)")
                 updateTitle()
                 rebuildMenuIfOpen()
             }
-            consecutiveNoCandidateAlphaKeyCount = 0
         }
     }
 
@@ -664,6 +850,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             eventTapActive = true
             log("event tap re-enabled reason=\(type)")
         }
+
+        // Always install global monitor as fallback after a tap disable event.
+        // noteInputEvent() will confirm CGEvent is working again.
+        installGlobalMonitor()
 
         updateTitle()
         rebuildMenu()
@@ -724,7 +914,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 log("target IME re-entered from bundle=\(previousSourceBundleID)")
                 // Reset pending alpha keys so the candidate check starts fresh
                 pendingAlphaKeyCount = 0
-                consecutiveNoCandidateAlphaKeyCount = 0
                 candidateCheckTimer?.invalidate()
                 candidateCheckTimer = nil
                 markTargetModeUnknown(reason: "target IME re-entered after switching away")
@@ -792,6 +981,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func handleShiftKeyChange(source: String, keyCode: Int64, isDown: Bool) {
+        // Track key activity for adaptive poll throttling
+        lastKeyActivityAt = CFAbsoluteTimeGetCurrent()
 
         if isDown {
             if activeShiftKeys.isEmpty {
@@ -803,7 +994,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftDownWasTarget = isTargetInputMethodSelected
                 shiftHadOtherKey = false
                 shiftSourceChanged = false
-                logVerbose("shift down source=\(source) key=\(keyCode) current=\(currentSource.id)")
+                log("shift down source=\(source) key=\(keyCode) current=\(currentSource.id)")
             }
             activeShiftKeys.insert(keyCode)
             return
@@ -814,7 +1005,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         activeShiftKeys.remove(keyCode)
-        logVerbose("shift up source=\(source) key=\(keyCode) remaining=\(activeShiftKeys.count)")
+        log("shift up source=\(source) key=\(keyCode) remaining=\(activeShiftKeys.count)")
 
         if activeShiftKeys.isEmpty {
             finishShiftTap(source: source)
@@ -838,7 +1029,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         guard !shiftHadOtherKey else {
-            logVerbose("shift ignored source=\(source) reason=combined")
+            log("shift ignored source=\(source) reason=combined")
             if shiftSourceChanged && shiftDownWasTarget {
                 markTargetModeUnknown(reason: "input source changed while shift was held")
             }
@@ -848,7 +1039,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let now = CFAbsoluteTimeGetCurrent()
         let duration = now - startedAt
         guard duration <= maximumStandaloneShiftTapDuration else {
-            logVerbose("shift ignored source=\(source) reason=long duration=\(duration)")
+            log("shift ignored source=\(source) reason=long duration=\(duration)")
             if shiftDownWasTarget {
                 markTargetModeUnknown(reason: "standalone shift duration was too long")
             }
@@ -858,34 +1049,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshInputSource()
 
         guard shiftDownWasTarget else {
-            logVerbose("shift ignored source=\(source) reason=started-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
+            log("shift ignored source=\(source) reason=started-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
             return
         }
 
         guard isTargetInputMethodSelected else {
-            logVerbose("shift ignored source=\(source) reason=ended-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
+            log("shift ignored source=\(source) reason=ended-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
             markTargetModeUnknown(reason: "target input source changed during shift tap")
             return
         }
 
         guard currentSource.id == shiftDownSourceID && currentSource.bundleID == shiftDownBundleID else {
-            logVerbose("shift ignored source=\(source) reason=source-changed start=\(shiftDownSourceID) current=\(currentSource.id)")
+            log("shift ignored source=\(source) reason=source-changed start=\(shiftDownSourceID) current=\(currentSource.id)")
             markTargetModeUnknown(reason: "input source changed during shift tap")
             return
         }
 
-        // Debounce rapid shift toggles to stay in sync with Doubao's internal
-        // ShiftKeyEventCoalescer.
-        let gapSinceLastToggle = now - lastShiftToggleAt
-        guard gapSinceLastToggle >= minimumShiftToggleGap else {
-            logVerbose("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
-            return
+        // --- Improvement: debounce rapid shift toggles ---
+        // When Accessibility-based verification is unavailable, we debounce
+        // to stay in sync with Doubao's internal ShiftKeyEventCoalescer.
+        // When AX is active, skip the debounce because AX will verify/correct.
+        if !cachedAXTrusted {
+            let gapSinceLastToggle = now - lastShiftToggleAt
+            guard gapSinceLastToggle >= minimumShiftToggleGap else {
+                log("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
+                return
+            }
         }
 
         guard targetModeKnown else {
             log("shift observed source=\(source) reason=unknown-mode-needs-calibration")
             updateTitle()
             rebuildMenuIfOpen()
+            schedulePostShiftVerification()
             return
         }
 
@@ -899,40 +1095,69 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         log("shift toggled source=\(source) mode=\(displayMode.detail)")
         updateTitle()
         rebuildMenuIfOpen()
+        schedulePostShiftVerification()
+    }
+
+    /// Timers for the post-Shift verification burst.  Kept so that rapid
+    /// Shift taps cancel stale timers instead of accumulating them.
+    private var postShiftTimers = [Timer]()
+
+    /// After a Shift toggle, the IME shows a small "中"/"英" indicator window
+    /// for about 1 second.  Schedule a quick burst of checks to capture and
+    /// OCR it for authoritative calibration.
+    private func schedulePostShiftVerification() {
+        // Cancel any outstanding burst from a previous Shift tap.
+        for t in postShiftTimers { t.invalidate() }
+        postShiftTimers.removeAll()
+
+        for delay in [0.15, 0.4, 0.7] {
+            let t = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+                self?.pollCandidateWindow()
+            }
+            postShiftTimers.append(t)
+        }
+    }
+
+    // MARK: - Accessibility trust cache
+
+    private var _cachedAXTrusted: Bool?
+    private var _cachedAXTrustedAt: CFAbsoluteTime = 0
+
+    /// Cached wrapper around `AXIsProcessTrusted()`.  The trust state almost
+    /// never changes at runtime, so we re-check at most every 10 seconds.
+    private var cachedAXTrusted: Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let cached = _cachedAXTrusted, now - _cachedAXTrustedAt < 10.0 {
+            return cached
+        }
+        let value = AXIsProcessTrusted()
+        _cachedAXTrusted = value
+        _cachedAXTrustedAt = now
+        return value
     }
 
     private func markTargetModeUnknown(reason: String) {
         let hadSavedState = UserDefaults.standard.object(forKey: appConfig.modeStateKey) != nil
-        let changed = targetModeKnown || hadSavedState
+        guard targetModeKnown || hadSavedState else {
+            return
+        }
 
         targetModeKnown = false
         UserDefaults.standard.removeObject(forKey: appConfig.modeStateKey)
-        pendingAlphaKeyCount = 0
-        consecutiveNoCandidateAlphaKeyCount = 0
         // Clear auto-calibration cooldown so that candidate-window detection
         // can kick in immediately once the user starts typing.
         lastAutoCalibrationAt = 0
-        if changed {
-            log("mode marked unknown reason=\(reason)")
-            updateTitle()
-            rebuildMenuIfOpen()
-        } else {
-            logVerbose("mode already unknown reason=\(reason)")
-        }
+        log("mode marked unknown reason=\(reason)")
+        updateTitle()
+        rebuildMenuIfOpen()
     }
 
-    private func setTargetModeChinese(reason: String) {
-        targetModeChinese = true
+    private func setTargetMode(chinese: Bool, reason: String) {
+        targetModeChinese = chinese
         targetModeKnown = true
         UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
-        log("mode set mode=中文 reason=\(reason)")
-    }
-
-    private func setTargetModeEnglish(reason: String) {
-        targetModeChinese = false
-        targetModeKnown = true
-        UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
-        log(reason)
+        let label = chinese ? "中文" : "英文"
+        log("mode set mode=\(label) reason=\(reason)")
     }
 
     private func resetShiftTracking() {
@@ -1096,13 +1321,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func calibrateChinese() {
-        setTargetModeChinese(reason: "manual calibration")
+        setTargetMode(chinese: true, reason: "manual calibration")
         updateTitle()
         rebuildMenu()
     }
 
     @objc private func calibrateEnglish() {
-        setTargetModeEnglish(reason: "mode calibrated mode=英文")
+        setTargetMode(chinese: false, reason: "manual calibration")
         updateTitle()
         rebuildMenu()
     }
@@ -1265,21 +1490,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.runModal()
     }
 
-    private func noteInputEvent(source: String) {
+    private func noteInputEvent() {
         guard !observedInputEvent else {
-            if source == "cgevent" && eventTapActive && globalFlagsMonitor != nil {
-                removeGlobalMonitor()
-                log("global monitor removed reason=cgevent-observed")
-            }
             return
         }
 
         observedInputEvent = true
-        log("input monitoring observed event source=\(source)")
-        if source == "cgevent" && eventTapActive {
-            removeGlobalMonitor()
-            log("global monitor removed reason=cgevent-observed")
-        }
+        log("input monitoring observed event")
         updateTitle()
         rebuildMenuIfOpen()
     }
@@ -1319,7 +1536,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func preferredInstalledAppPath() -> String {
-        let installed = "/Applications/\(appConfig.appName).app"
+        let installed = "\(NSHomeDirectory())/Applications/\(appConfig.appName).app"
         if FileManager.default.fileExists(atPath: installed) {
             return installed
         }
@@ -1375,35 +1592,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
-    private func rotateLogIfNeeded(additionalBytes: Int) {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
-              let size = attributes[.size] as? NSNumber,
-              size.uint64Value + UInt64(additionalBytes) > maximumLogFileSize else {
-            return
-        }
-
-        try? FileManager.default.removeItem(at: rotatedLogFileURL)
-        try? FileManager.default.moveItem(at: logFileURL, to: rotatedLogFileURL)
-    }
-
-    private func clearLogFiles() {
-        ensureLogDirectory()
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: logDirectoryURL,
-            includingPropertiesForKeys: nil
-        ) else {
-            return
-        }
-
-        for url in contents {
-            let name = url.lastPathComponent
-            if name == appConfig.logFileName || name.hasPrefix("\(appConfig.logFileName).") {
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-    }
-
     private func log(_ message: String) {
         let timestamp = logDateFormatter.string(from: Date())
         let line = "\(timestamp) \(message)\n"
@@ -1436,6 +1624,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
         logDirectoryCreated = true
+    }
+
+    private func rotateLogIfNeeded(additionalBytes: Int) {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+              let size = attributes[.size] as? NSNumber,
+              size.uint64Value + UInt64(additionalBytes) > maximumLogFileSize else {
+            return
+        }
+
+        try? FileManager.default.removeItem(at: rotatedLogFileURL)
+        try? FileManager.default.moveItem(at: logFileURL, to: rotatedLogFileURL)
+    }
+
+    private func clearLogFiles() {
+        ensureLogDirectory()
+
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: logDirectoryURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for url in contents {
+            let name = url.lastPathComponent
+            if name == appConfig.logFileName || name.hasPrefix("\(appConfig.logFileName).") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
     }
 }
 

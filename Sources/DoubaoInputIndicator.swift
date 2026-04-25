@@ -326,6 +326,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let minimumShiftToggleGap: CFAbsoluteTime = 0.35
     /// Timestamp of the last accepted shift toggle.
     private var lastShiftToggleAt: CFAbsoluteTime = 0
+    private let maximumLogFileSize: UInt64 = 1_048_576
+
+    private var logDirectoryURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs", isDirectory: true)
+    }
+
+    private var logFileURL: URL {
+        logDirectoryURL.appendingPathComponent(appConfig.logFileName)
+    }
+
+    private var rotatedLogFileURL: URL {
+        logFileURL.appendingPathExtension("old")
+    }
 
     // --- Mode indicator window detection ---
     /// Window IDs of small (mode indicator) windows seen in the previous poll.
@@ -850,6 +863,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
     }
 
+    private var appBuildTime: String {
+        Bundle.main.object(forInfoDictionaryKey: "BuildTime") as? String ?? "未知"
+    }
+
     private var displayMode: DisplayMode {
         if isTargetInputMethodSelected {
             guard targetModeKnown else {
@@ -1112,6 +1129,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         launchAtLogin.state = launchAtLoginEnabled ? .on : .off
         menu.addItem(launchAtLogin)
 
+        let logs = NSMenuItem(title: "日志", action: #selector(openLogsDirectory), keyEquivalent: "")
+        logs.target = self
+        menu.addItem(logs)
+
+        let clearLogs = NSMenuItem(title: "清空日志", action: #selector(clearLogs), keyEquivalent: "")
+        clearLogs.target = self
+        menu.addItem(clearLogs)
+
         menu.addItem(.separator())
 
         let appNameItem = NSMenuItem(title: appConfig.displayName, action: nil, keyEquivalent: "")
@@ -1134,6 +1159,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let version = NSMenuItem(title: "版本 \(appVersion)", action: nil, keyEquivalent: "")
         version.isEnabled = false
         menu.addItem(version)
+
+        let buildTime = NSMenuItem(title: "构建时间 \(appBuildTime)", action: nil, keyEquivalent: "")
+        buildTime.isEnabled = false
+        menu.addItem(buildTime)
 
         let updateTitle = updateCheckInProgress ? "正在检查更新..." : "检查更新..."
         let update = NSMenuItem(title: updateTitle, action: #selector(checkForUpdates), keyEquivalent: "")
@@ -1180,6 +1209,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func openInputMonitoringSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openLogsDirectory() {
+        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logFileURL.path) {
+            FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([logFileURL])
+    }
+
+    @objc private func clearLogs() {
+        clearLogFiles()
+        FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
     }
 
     @objc private func openGitHub() {
@@ -1413,12 +1455,43 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private func rotateLogIfNeeded(additionalBytes: Int) {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+              let size = attributes[.size] as? NSNumber,
+              size.uint64Value + UInt64(additionalBytes) > maximumLogFileSize else {
+            return
+        }
+
+        try? FileManager.default.removeItem(at: rotatedLogFileURL)
+        try? FileManager.default.moveItem(at: logFileURL, to: rotatedLogFileURL)
+    }
+
+    private func clearLogFiles() {
+        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: logDirectoryURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for url in contents {
+            let name = url.lastPathComponent
+            if name == appConfig.logFileName || name.hasPrefix("\(appConfig.logFileName).") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
     private func log(_ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let line = "\(timestamp) \(message)\n"
-        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/\(appConfig.logFileName)")
+        let url = logFileURL
 
         if let data = line.data(using: .utf8) {
+            try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+            rotateLogIfNeeded(additionalBytes: data.count)
             if FileManager.default.fileExists(atPath: url.path),
                let handle = try? FileHandle(forWritingTo: url) {
                 defer { try? handle.close() }

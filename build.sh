@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 VARIANT="${1:-doubao}"
 APP_VERSION="${APP_VERSION:-${VERSION:-1.1.2}}"
 APP_BUILD="${APP_BUILD:-$APP_VERSION}"
+APP_BUILD_TIME="${APP_BUILD_TIME:-$(date '+%Y-%m-%d %H:%M:%S %z')}"
 DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET:-12.0}"
 
 case "$VARIANT" in
@@ -103,6 +104,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>$APP_BUILD</string>
+  <key>BuildTime</key>
+  <string>$APP_BUILD_TIME</string>
   <key>LSMinimumSystemVersion</key>
   <string>$DEPLOYMENT_TARGET</string>
   <key>LSUIElement</key>

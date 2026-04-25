@@ -211,11 +211,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let statusItem = NSStatusBar.system.statusItem(withLength: 22)
     private let menu = NSMenu()
     private let maximumStandaloneShiftTapDuration: CFAbsoluteTime = 1.0
+    private let verboseEventLogging = UserDefaults.standard.bool(forKey: "verboseEventLogging")
+    private let logDateFormatter = ISO8601DateFormatter()
 
     private var timer: Timer?
     private var eventTap: CFMachPort?
     private var eventRunLoopSource: CFRunLoopSource?
     private var globalFlagsMonitor: Any?
+    private var menuIsOpen = false
+    private var lastRenderedTitle = ""
+    private var lastRenderedTooltip = ""
+    private var logDirectoryCreated = false
 
     private var currentSource = InputSourceReader.Source(id: "", name: "", bundleID: "", inputModeID: "")
     private var targetModeChinese = UserDefaults.standard.object(forKey: appConfig.modeStateKey) as? Bool ?? true
@@ -290,7 +296,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshInputSource()
         requestListenAccessIfNeeded()
         installEventTap()
-        installGlobalMonitor()
+        if !eventTapActive || !listenAccessGranted {
+            installGlobalMonitor()
+        } else {
+            log("global monitor skipped reason=event-tap-active-and-authorized")
+        }
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             self?.refreshInputSource()
@@ -302,15 +312,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         removeEventTap()
         candidateCheckTimer?.invalidate()
         candidateCheckTimer = nil
-        if let globalFlagsMonitor {
-            NSEvent.removeMonitor(globalFlagsMonitor)
-        }
-        globalFlagsMonitor = nil
+        removeGlobalMonitor()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
         refreshListenAccessStatus()
         rebuildMenu()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 
     private func requestListenAccessIfNeeded() {
@@ -382,6 +394,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         CGEvent.tapEnable(tap: eventTap, enable: true)
         eventTapActive = true
         log("event tap active")
+        removeGlobalMonitor()
         rebuildMenu()
         updateTitle()
     }
@@ -399,6 +412,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func installGlobalMonitor() {
+        guard globalFlagsMonitor == nil else {
+            return
+        }
+
         globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] event in
             self?.handle(event: event)
         }
@@ -410,6 +427,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private func removeGlobalMonitor() {
+        if let globalFlagsMonitor {
+            NSEvent.removeMonitor(globalFlagsMonitor)
+        }
+        globalFlagsMonitor = nil
+    }
+
     private func handle(event: NSEvent) {
         let keyCode = event.type == .flagsChanged ? Int64(event.keyCode) : nil
         guard !shouldIgnoreEventDuringStartup(source: "nsevent", keyCode: keyCode) else {
@@ -417,7 +441,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         switch event.type {
         case .keyDown:
-            noteInputEvent()
+            noteInputEvent(source: "nsevent")
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
@@ -449,7 +473,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         switch type {
         case .keyDown:
-            noteInputEvent()
+            noteInputEvent(source: "cgevent")
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
@@ -477,11 +501,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let now = CFAbsoluteTimeGetCurrent()
 
-        let snap = CandidateWindowMonitor.snapshot(bundleID: appConfig.targetInputMethodBundleID)
-
         guard now - lastAutoCalibrationAt >= autoCalibrationCooldown else {
             return
         }
+
+        let snap = CandidateWindowMonitor.snapshot(bundleID: appConfig.targetInputMethodBundleID)
 
         if snap.candidateVisible {
             if !targetModeKnown || !targetModeChinese {
@@ -492,7 +516,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 lastAutoCalibrationAt = now
                 log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible source=poll")
                 updateTitle()
-                rebuildMenu()
+                rebuildMenuIfOpen()
             }
         }
     }
@@ -584,7 +608,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 lastAutoCalibrationAt = now
                 log("auto-calibrate mode=中文 old=\(oldMode) trigger=candidate-window-visible source=keydown keys=\(keysTyped)")
                 updateTitle()
-                rebuildMenu()
+                rebuildMenuIfOpen()
             }
         } else {
             consecutiveNoCandidateAlphaKeyCount += keysTyped
@@ -608,7 +632,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 lastAutoCalibrationAt = now
                 log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window source=keydown keys=\(consecutiveNoCandidateAlphaKeyCount)")
                 updateTitle()
-                rebuildMenu()
+                rebuildMenuIfOpen()
             }
             consecutiveNoCandidateAlphaKeyCount = 0
         }
@@ -707,7 +731,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
 
             updateTitle()
-            rebuildMenu()
+            rebuildMenuIfOpen()
         } else {
             updateTitle()
         }
@@ -779,7 +803,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftDownWasTarget = isTargetInputMethodSelected
                 shiftHadOtherKey = false
                 shiftSourceChanged = false
-                log("shift down source=\(source) key=\(keyCode) current=\(currentSource.id)")
+                logVerbose("shift down source=\(source) key=\(keyCode) current=\(currentSource.id)")
             }
             activeShiftKeys.insert(keyCode)
             return
@@ -790,7 +814,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         activeShiftKeys.remove(keyCode)
-        log("shift up source=\(source) key=\(keyCode) remaining=\(activeShiftKeys.count)")
+        logVerbose("shift up source=\(source) key=\(keyCode) remaining=\(activeShiftKeys.count)")
 
         if activeShiftKeys.isEmpty {
             finishShiftTap(source: source)
@@ -814,7 +838,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         guard !shiftHadOtherKey else {
-            log("shift ignored source=\(source) reason=combined")
+            logVerbose("shift ignored source=\(source) reason=combined")
             if shiftSourceChanged && shiftDownWasTarget {
                 markTargetModeUnknown(reason: "input source changed while shift was held")
             }
@@ -824,7 +848,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let now = CFAbsoluteTimeGetCurrent()
         let duration = now - startedAt
         guard duration <= maximumStandaloneShiftTapDuration else {
-            log("shift ignored source=\(source) reason=long duration=\(duration)")
+            logVerbose("shift ignored source=\(source) reason=long duration=\(duration)")
             if shiftDownWasTarget {
                 markTargetModeUnknown(reason: "standalone shift duration was too long")
             }
@@ -834,18 +858,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshInputSource()
 
         guard shiftDownWasTarget else {
-            log("shift ignored source=\(source) reason=started-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
+            logVerbose("shift ignored source=\(source) reason=started-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
             return
         }
 
         guard isTargetInputMethodSelected else {
-            log("shift ignored source=\(source) reason=ended-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
+            logVerbose("shift ignored source=\(source) reason=ended-not-target start=\(shiftDownSourceID) current=\(currentSource.id)")
             markTargetModeUnknown(reason: "target input source changed during shift tap")
             return
         }
 
         guard currentSource.id == shiftDownSourceID && currentSource.bundleID == shiftDownBundleID else {
-            log("shift ignored source=\(source) reason=source-changed start=\(shiftDownSourceID) current=\(currentSource.id)")
+            logVerbose("shift ignored source=\(source) reason=source-changed start=\(shiftDownSourceID) current=\(currentSource.id)")
             markTargetModeUnknown(reason: "input source changed during shift tap")
             return
         }
@@ -854,14 +878,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         // ShiftKeyEventCoalescer.
         let gapSinceLastToggle = now - lastShiftToggleAt
         guard gapSinceLastToggle >= minimumShiftToggleGap else {
-            log("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
+            logVerbose("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
             return
         }
 
         guard targetModeKnown else {
             log("shift observed source=\(source) reason=unknown-mode-needs-calibration")
             updateTitle()
-            rebuildMenu()
+            rebuildMenuIfOpen()
             return
         }
 
@@ -874,24 +898,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         lastAutoCalibrationAt = now
         log("shift toggled source=\(source) mode=\(displayMode.detail)")
         updateTitle()
-        rebuildMenu()
+        rebuildMenuIfOpen()
     }
 
     private func markTargetModeUnknown(reason: String) {
         let hadSavedState = UserDefaults.standard.object(forKey: appConfig.modeStateKey) != nil
-        guard targetModeKnown || hadSavedState else {
-            return
-        }
+        let changed = targetModeKnown || hadSavedState
 
         targetModeKnown = false
         UserDefaults.standard.removeObject(forKey: appConfig.modeStateKey)
+        pendingAlphaKeyCount = 0
         consecutiveNoCandidateAlphaKeyCount = 0
         // Clear auto-calibration cooldown so that candidate-window detection
         // can kick in immediately once the user starts typing.
         lastAutoCalibrationAt = 0
-        log("mode marked unknown reason=\(reason)")
-        updateTitle()
-        rebuildMenu()
+        if changed {
+            log("mode marked unknown reason=\(reason)")
+            updateTitle()
+            rebuildMenuIfOpen()
+        } else {
+            logVerbose("mode already unknown reason=\(reason)")
+        }
     }
 
     private func setTargetModeChinese(reason: String) {
@@ -921,9 +948,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateTitle() {
         let title = needsInputMonitoringPermission ? "🥶" : displayMode.title
+        let tooltip = tooltipText()
+
+        guard title != lastRenderedTitle || tooltip != lastRenderedTooltip else {
+            return
+        }
 
         statusItem.button?.title = title
-        statusItem.button?.toolTip = tooltipText()
+        statusItem.button?.toolTip = tooltip
+        lastRenderedTitle = title
+        lastRenderedTooltip = tooltip
     }
 
     private func tooltipText() -> String {
@@ -1054,6 +1088,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(quit)
     }
 
+    private func rebuildMenuIfOpen() {
+        guard menuIsOpen else {
+            return
+        }
+        rebuildMenu()
+    }
+
     @objc private func calibrateChinese() {
         setTargetModeChinese(reason: "manual calibration")
         updateTitle()
@@ -1069,6 +1110,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func retryEventTap() {
         requestListenAccessIfNeeded()
         installEventTap()
+        if !eventTapActive || !listenAccessGranted {
+            installGlobalMonitor()
+        }
         updateTitle()
         rebuildMenu()
     }
@@ -1079,7 +1123,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func openLogsDirectory() {
-        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+        ensureLogDirectory()
         if !FileManager.default.fileExists(atPath: logFileURL.path) {
             FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
         }
@@ -1089,6 +1133,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func clearLogs() {
         clearLogFiles()
         FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
+        logDirectoryCreated = true
     }
 
     @objc private func openGitHub() {
@@ -1220,15 +1265,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.runModal()
     }
 
-    private func noteInputEvent() {
+    private func noteInputEvent(source: String) {
         guard !observedInputEvent else {
+            if source == "cgevent" && eventTapActive && globalFlagsMonitor != nil {
+                removeGlobalMonitor()
+                log("global monitor removed reason=cgevent-observed")
+            }
             return
         }
 
         observedInputEvent = true
-        log("input monitoring observed event")
+        log("input monitoring observed event source=\(source)")
+        if source == "cgevent" && eventTapActive {
+            removeGlobalMonitor()
+            log("global monitor removed reason=cgevent-observed")
+        }
         updateTitle()
-        rebuildMenu()
+        rebuildMenuIfOpen()
     }
 
     private func enableLaunchAtLogin() {
@@ -1334,7 +1387,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func clearLogFiles() {
-        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+        ensureLogDirectory()
 
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: logDirectoryURL,
@@ -1352,12 +1405,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func log(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = logDateFormatter.string(from: Date())
         let line = "\(timestamp) \(message)\n"
         let url = logFileURL
 
         if let data = line.data(using: .utf8) {
-            try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+            ensureLogDirectory()
             rotateLogIfNeeded(additionalBytes: data.count)
             if FileManager.default.fileExists(atPath: url.path),
                let handle = try? FileHandle(forWritingTo: url) {
@@ -1368,6 +1421,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 try? data.write(to: url)
             }
         }
+    }
+
+    private func logVerbose(_ message: String) {
+        guard verboseEventLogging else {
+            return
+        }
+        log(message)
+    }
+
+    private func ensureLogDirectory() {
+        guard !logDirectoryCreated else {
+            return
+        }
+        try? FileManager.default.createDirectory(at: logDirectoryURL, withIntermediateDirectories: true)
+        logDirectoryCreated = true
     }
 }
 

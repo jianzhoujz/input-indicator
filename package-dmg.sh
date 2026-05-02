@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VARIANT="${1:-doubao}"
-APP_VERSION="${APP_VERSION:-${VERSION:-1.2.0}}"
+APP_VERSION="${APP_VERSION:-${VERSION:-1.2.1}}"
 APP_BUILD="${APP_BUILD:-$APP_VERSION}"
 
 case "$VARIANT" in

@@ -1340,7 +1340,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         gitHub.target = self
         menu.addItem(gitHub)
 
-        let star = NSMenuItem(title: "⭐ 给个 Star", action: #selector(openGitHubStar), keyEquivalent: "")
+        let star = NSMenuItem(title: "给个 Star", action: #selector(openGitHubStar), keyEquivalent: "")
         star.target = self
         menu.addItem(star)
 

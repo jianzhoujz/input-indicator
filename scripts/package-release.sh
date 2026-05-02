@@ -13,7 +13,7 @@ set -euo pipefail
 VERSION="${1:-1.0.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TAP_ROOT="$(cd "${PROJECT_ROOT}/../homebrew-tap" 2>/dev/null || echo '')"
+TAP_ROOT="$(cd "${PROJECT_ROOT}/../homebrew-tap" 2>/dev/null && pwd || echo '')"
 DIST_DIR="${PROJECT_ROOT}/dist"
 
 # Validate

@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VARIANT="${1:-doubao}"
-APP_VERSION="${APP_VERSION:-${VERSION:-1.1.2}}"
+APP_VERSION="${APP_VERSION:-${VERSION:-1.2.0}}"
+APP_BUILD="${APP_BUILD:-$APP_VERSION}"
 
 case "$VARIANT" in
   doubao)
@@ -30,7 +31,7 @@ VOLUME_NAME="$APP_NAME"
 MOUNT_DIR="/Volumes/$VOLUME_NAME"
 DMG_ASSET_DIR="$ROOT/packaging/dmg"
 
-"$ROOT/build.sh" "$VARIANT" >/dev/null
+APP_VERSION="$APP_VERSION" APP_BUILD="$APP_BUILD" "$ROOT/build.sh" "$VARIANT" >/dev/null
 
 rm -rf "$WORK_DIR"
 mkdir -p "$STAGE_DIR/.background" "$DIST_DIR"

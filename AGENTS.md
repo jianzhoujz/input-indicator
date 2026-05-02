@@ -59,7 +59,7 @@ input-indicator/
 ├── packaging/
 │   └── dmg/                        ← DMG 打包用的 .DS_Store / 背景图
 ├── scripts/
-│   └── package-release.sh          ← 同时打两个 zip 给 Homebrew tap 用
+│   └── package-release.sh          ← 同时打两个 DMG 给 Homebrew tap 用
 ├── docs/
 │   └── images/                     ← README 用图
 ├── build.sh                        ← swiftc + lipo + codesign，输出 build/<App>.app
@@ -392,7 +392,7 @@ defaults write local.wetype-input-indicator verboseEventLogging -bool true
 
 ### 4.3 发布流程
 
-发布走 [scripts/package-release.sh](scripts/package-release.sh) 同时打两个 zip，配合相邻仓库
+发布走 [scripts/package-release.sh](scripts/package-release.sh) 同时打两个 DMG，配合相邻仓库
 `/Users/zhou/Projects/demo/homebrew-tap` 的 cask。完整步骤参考
 DEVELOPMENT_CONTEXT.md（仅本地，含具体路径和步骤）。
 

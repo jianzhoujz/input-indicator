@@ -155,12 +155,22 @@ private final class CandidateWindowMonitor {
         }?.processIdentifier
     }
 
+    /// Bounds of an indicator-sized IME window in screen coordinates.
+    struct IndicatorWindow {
+        let wid: CGWindowID
+        let frame: CGRect
+    }
+
     /// Snapshot of on-screen IME windows relevant to mode detection.
     struct WindowSnapshot {
         /// Whether a tall candidate panel is visible (Chinese input active).
         let candidateVisible: Bool
         /// Window IDs of small indicator-sized windows (the "中"/"英" tooltip).
         let indicatorWIDs: Set<CGWindowID>
+        /// Frames of those indicator windows, keyed by window ID. Used to
+        /// scope Accessibility text reads to the indicator's screen rect
+        /// instead of the entire IME process AX tree.
+        let indicatorFrames: [CGWindowID: CGRect]
     }
 
     /// Scans on-screen windows owned by the target IME and returns a snapshot
@@ -170,18 +180,19 @@ private final class CandidateWindowMonitor {
                          indicatorMaxSize: Int,
                          logHandler: ((String) -> Void)? = nil) -> WindowSnapshot {
         guard let pid = cachedFindIMEProcessID(bundleID) else {
-            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [])
+            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [], indicatorFrames: [:])
         }
 
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [])
+            return WindowSnapshot(candidateVisible: false, indicatorWIDs: [], indicatorFrames: [:])
         }
 
         var candidateVisible = false
         var indicatorWIDs = Set<CGWindowID>()
+        var indicatorFrames = [CGWindowID: CGRect]()
         var scannedCount = 0
 
         for info in windowList {
@@ -213,6 +224,9 @@ private final class CandidateWindowMonitor {
                 let wid = info[kCGWindowNumber as String] as? CGWindowID ?? 0
                 if wid != 0 {
                     indicatorWIDs.insert(wid)
+                    let x = (bounds["X"] as? Double) ?? Double(bounds["X"] as? Int ?? 0)
+                    let y = (bounds["Y"] as? Double) ?? Double(bounds["Y"] as? Int ?? 0)
+                    indicatorFrames[wid] = CGRect(x: x, y: y, width: Double(width), height: Double(height))
                 }
             }
         }
@@ -222,7 +236,8 @@ private final class CandidateWindowMonitor {
         }
 
         return WindowSnapshot(candidateVisible: candidateVisible,
-                              indicatorWIDs: indicatorWIDs)
+                              indicatorWIDs: indicatorWIDs,
+                              indicatorFrames: indicatorFrames)
     }
 
     /// Returns `true` when the target IME currently has an on-screen candidate
@@ -263,36 +278,51 @@ private final class CandidateWindowMonitor {
         case unrecognized
     }
 
-    /// Use the Accessibility API to read text content from the IME process's
-    /// UI elements.  The small "中"/"英" tooltip shown on mode switch is
-    /// typically exposed as a child element with a value or title attribute.
-    /// This requires Accessibility permission but NOT Screen Recording.
-    static func recognizeModeFromAccessibility(pid: pid_t) -> (RecognizedMode, String) {
+    /// Use the Accessibility API to read text content scoped to a specific
+    /// indicator window's screen rectangle.  This avoids walking the IME
+    /// process's entire AX tree (which contains settings panels, dictionary
+    /// windows, toolbars, etc., any of which may legitimately contain "中" or
+    /// "英" characters and cause false-positive mode flips).
+    ///
+    /// We hit-test the centre of the rect with `AXUIElementCopyElementAtPosition`,
+    /// then walk only that element's small subtree (depth 3, child cap 8) and
+    /// require an exact single-character match — `中` means Chinese, `英`
+    /// means English.  Anything else is `.unrecognized` and the caller leaves
+    /// the tracked mode untouched.
+    static func recognizeModeFromIndicatorRect(pid: pid_t, rect: CGRect) -> (RecognizedMode, String) {
         let app = AXUIElementCreateApplication(pid)
+        let centre = CGPoint(x: rect.midX, y: rect.midY)
 
-        // Try to read all children of the application element.  IME overlay
-        // windows (candidate panel, mode indicator) may appear as children
-        // even if they are not reported via kAXWindowsAttribute.
+        var hit: AXUIElement?
+        var hitRef: AXUIElement?
+        if AXUIElementCopyElementAtPosition(app, Float(centre.x), Float(centre.y), &hitRef) == .success {
+            hit = hitRef
+        }
+
         var texts = [String]()
-        collectTexts(from: app, into: &texts, depth: 0, maxDepth: 5)
+        if let element = hit {
+            collectTexts(from: element, into: &texts, depth: 0, maxDepth: 3, childCap: 8)
+        }
 
         for text in texts {
-            if text.contains("中") { return (.chinese, text) }
-            if text.contains("英") { return (.english, text) }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "中" { return (.chinese, trimmed) }
+            if trimmed == "英" { return (.english, trimmed) }
         }
 
         return (.unrecognized, texts.joined(separator: "|"))
     }
 
     /// Recursively collect text content (title, value, description) from an
-    /// AXUIElement tree.
+    /// AXUIElement tree, capped by depth and per-node child count to keep the
+    /// scan bounded when reading a small indicator subtree.
     private static func collectTexts(from element: AXUIElement,
                                      into texts: inout [String],
                                      depth: Int,
-                                     maxDepth: Int) {
+                                     maxDepth: Int,
+                                     childCap: Int) {
         guard depth <= maxDepth else { return }
 
-        // Try common text attributes
         for attr in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] as [String] {
             var ref: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, attr as CFString, &ref) == .success,
@@ -301,15 +331,14 @@ private final class CandidateWindowMonitor {
             }
         }
 
-        // Recurse into children
         var childrenRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
               let children = childrenRef as? [AXUIElement] else {
             return
         }
 
-        for child in children {
-            collectTexts(from: child, into: &texts, depth: depth + 1, maxDepth: maxDepth)
+        for child in children.prefix(childCap) {
+            collectTexts(from: child, into: &texts, depth: depth + 1, maxDepth: maxDepth, childCap: childCap)
         }
     }
 }
@@ -649,11 +678,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         if !newWIDs.isEmpty {
             // A new indicator window appeared → the IME just changed modes.
-            // Use Accessibility API to read the mode text from the IME process.
+            // Read mode text scoped to that window's screen rect (avoids
+            // accidentally picking up "中"/"英" characters from unrelated IME
+            // UI like settings panels or dictionary windows).
             guard let pid = CandidateWindowMonitor.findIMEProcessID(appConfig.targetInputMethodBundleID) else {
                 return
             }
-            let (recognized, detail) = CandidateWindowMonitor.recognizeModeFromAccessibility(pid: pid)
+
+            var recognized = CandidateWindowMonitor.RecognizedMode.unrecognized
+            var detail = ""
+            for wid in newWIDs {
+                guard let rect = snap.indicatorFrames[wid] else { continue }
+                let (mode, text) = CandidateWindowMonitor.recognizeModeFromIndicatorRect(pid: pid, rect: rect)
+                if mode != .unrecognized {
+                    recognized = mode
+                    detail = text
+                    break
+                }
+                if !text.isEmpty {
+                    detail = text
+                }
+            }
+
             switch recognized {
             case .chinese:
                 let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
@@ -806,21 +852,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 rebuildMenuIfOpen()
             }
         } else {
-            log("candidate-check no-candidate keys=\(keysTyped)")
-            // Multiple alphabetic keys typed without a candidate window → very
-            // likely English mode.  We require at least 2 keys to reduce false
-            // positives (the first key in Chinese mode may not yet show the
-            // panel if the user types slowly).
-            if keysTyped >= 2, !targetModeKnown || targetModeChinese {
-                let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
-                targetModeChinese = false
-                targetModeKnown = true
-                UserDefaults.standard.set(targetModeChinese, forKey: appConfig.modeStateKey)
-                lastAutoCalibrationAt = now
-                log("auto-calibrate mode=英文 old=\(oldMode) trigger=no-candidate-window source=keydown keys=\(keysTyped)")
-                updateTitle()
-                rebuildMenuIfOpen()
-            }
+            // Absence of candidate window is NOT a reliable English signal:
+            // the user might be typing in a non-IME-aware control, in
+            // Doubao's own settings/search field, in a password field, or
+            // simply between commits where the panel briefly hides. Trust
+            // only positive Chinese evidence; never infer English here.
+            log("candidate-check no-candidate keys=\(keysTyped) (no inference)")
         }
     }
 

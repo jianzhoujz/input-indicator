@@ -344,6 +344,12 @@ private final class CandidateWindowMonitor {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct CGEventSnapshot {
+        let type: CGEventType
+        let keyCode: Int64?
+        let rawFlags: UInt64
+    }
+
     private let statusItem = NSStatusBar.system.statusItem(withLength: 22)
     private let menu = NSMenu()
     private let maximumStandaloneShiftTapDuration: CFAbsoluteTime = 1.0
@@ -380,6 +386,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var shiftSourceChanged = false
     private var activeShiftKeys = Set<Int64>()
     private var ignoreEventsUntil = CFAbsoluteTimeGetCurrent() + 1.0
+    private var lastShiftEventKeyCode: Int64?
+    private var lastShiftEventIsDown: Bool?
+    private var lastShiftEventAt: CFAbsoluteTime = 0
+    private let duplicateShiftEventWindow: CFAbsoluteTime = 0.05
 
     // --- Candidate window auto-calibration ---
     /// Timer used to defer the candidate window check after a key press.
@@ -461,6 +471,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         removeEventTap()
         candidateCheckTimer?.invalidate()
         candidateCheckTimer = nil
+        for timer in postShiftTimers { timer.invalidate() }
+        postShiftTimers.removeAll()
         removeGlobalMonitor()
     }
 
@@ -527,7 +539,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 }
 
                 let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
-                delegate.handle(type: type, event: event)
+                let keyCode: Int64?
+                switch type {
+                case .flagsChanged, .keyDown:
+                    keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                default:
+                    keyCode = nil
+                }
+                let snapshot = CGEventSnapshot(type: type, keyCode: keyCode, rawFlags: event.flags.rawValue)
+                DispatchQueue.main.async {
+                    delegate.handle(snapshot: snapshot)
+                }
                 return Unmanaged.passUnretained(event)
             },
             userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
@@ -596,7 +618,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         switch event.type {
         case .keyDown:
-            noteInputEvent()
+            noteInputEvent(source: "nsevent")
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
@@ -607,40 +629,44 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 shiftHadOtherKey = true
             }
         case .flagsChanged:
+            noteInputEvent(source: "nsevent")
             handleFlagsChanged(event)
         default:
             break
         }
     }
 
-    private func handle(type: CGEventType, event: CGEvent) {
-        switch type {
+    private func handle(snapshot: CGEventSnapshot) {
+        switch snapshot.type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            handleEventTapDisabled(type)
+            handleEventTapDisabled(snapshot.type)
             return
         default:
             break
         }
 
-        let keyCode = type == .flagsChanged ? event.getIntegerValueField(.keyboardEventKeycode) : nil
+        let keyCode = snapshot.type == .flagsChanged ? snapshot.keyCode : nil
         guard !shouldIgnoreEventDuringStartup(source: "cgevent", keyCode: keyCode) else {
             return
         }
 
-        switch type {
+        switch snapshot.type {
         case .keyDown:
-            noteInputEvent()
+            noteInputEvent(source: "cgevent")
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
-            noteAlphaKeyDown(keyCode: event.getIntegerValueField(.keyboardEventKeycode))
+            if let keyCode = snapshot.keyCode {
+                noteAlphaKeyDown(keyCode: keyCode)
+            }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown,
              .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if shiftDownAt != nil {
                 shiftHadOtherKey = true
             }
         case .flagsChanged:
-            handleFlagsChanged(event)
+            noteInputEvent(source: "cgevent")
+            handleFlagsChanged(snapshot)
         default:
             break
         }
@@ -653,6 +679,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func pollCandidateWindow() {
         guard isTargetInputMethodSelected else {
             knownIndicatorWIDs.removeAll()
+            postShiftVerificationUntil = 0
             return
         }
 
@@ -674,10 +701,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         // --- Mode indicator window ("中"/"英" tooltip) detection ---
         let newWIDs = snap.indicatorWIDs.subtracting(knownIndicatorWIDs)
+        let indicatorWIDsToRead: Set<CGWindowID>
+        if now < postShiftVerificationUntil {
+            // During the post-Shift burst, read every visible indicator-sized
+            // window. Some IMEs reuse the same overlay window and only update
+            // its text, so relying on a new window ID can miss the correction.
+            indicatorWIDsToRead = snap.indicatorWIDs
+        } else {
+            indicatorWIDsToRead = newWIDs
+        }
         knownIndicatorWIDs = snap.indicatorWIDs
 
-        if !newWIDs.isEmpty {
-            // A new indicator window appeared → the IME just changed modes.
+        if !indicatorWIDsToRead.isEmpty {
+            // A mode indicator window appeared or is being verified after
+            // Shift → read its text for authoritative calibration.
             // Read mode text scoped to that window's screen rect (avoids
             // accidentally picking up "中"/"英" characters from unrelated IME
             // UI like settings panels or dictionary windows).
@@ -687,7 +724,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
             var recognized = CandidateWindowMonitor.RecognizedMode.unrecognized
             var detail = ""
-            for wid in newWIDs {
+            for wid in indicatorWIDsToRead {
                 guard let rect = snap.indicatorFrames[wid] else { continue }
                 let (mode, text) = CandidateWindowMonitor.recognizeModeFromIndicatorRect(pid: pid, rect: rect)
                 if mode != .unrecognized {
@@ -714,6 +751,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     log("indicator-ax confirmed mode=中文 text=\(detail)")
                 }
                 lastAutoCalibrationAt = now
+                postShiftVerificationUntil = 0
                 return
             case .english:
                 let oldMode = targetModeKnown ? (targetModeChinese ? "中文" : "英文") : "未知"
@@ -728,6 +766,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     log("indicator-ax confirmed mode=英文 text=\(detail)")
                 }
                 lastAutoCalibrationAt = now
+                postShiftVerificationUntil = 0
                 return
             case .unrecognized:
                 log("indicator-ax result=unrecognized detail=\(detail)")
@@ -809,8 +848,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     /// Checks whether the target IME's candidate window is on-screen and uses
     /// the result to auto-calibrate the tracked Chinese/English mode.
-    /// This path is triggered by keyDown events (requires Input Monitoring)
-    /// and can additionally detect English mode via the absence of candidates.
+    /// This path is triggered by keyDown events (requires Input Monitoring).
+    /// Candidate presence is Chinese evidence; candidate absence is ignored.
     private func performCandidateWindowCheck() {
         candidateCheckTimer = nil
 
@@ -888,21 +927,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             log("event tap re-enabled reason=\(type)")
         }
 
-        // Always install global monitor as fallback after a tap disable event.
-        // noteInputEvent() will confirm CGEvent is working again.
+        // Install the global monitor as a temporary fallback. The next
+        // observed CGEvent removes it again to avoid double-counting Shift.
         installGlobalMonitor()
 
         updateTitle()
         rebuildMenu()
     }
 
-    private func handleFlagsChanged(_ event: CGEvent) {
-        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+    private func handleFlagsChanged(_ event: CGEventSnapshot) {
+        guard let keyCode = event.keyCode else {
+            return
+        }
         guard isShiftKey(keyCode) else {
             return
         }
 
-        let isDown = isSpecificShiftDown(keyCode, rawFlags: event.flags.rawValue)
+        let isDown = isSpecificShiftDown(keyCode, rawFlags: event.rawFlags)
         handleShiftKeyChange(source: "cgevent", keyCode: keyCode, isDown: isDown)
     }
 
@@ -1018,13 +1059,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func handleShiftKeyChange(source: String, keyCode: Int64, isDown: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastShiftEventKeyCode == keyCode,
+           lastShiftEventIsDown == isDown,
+           now - lastShiftEventAt < duplicateShiftEventWindow {
+            logVerbose("shift duplicate ignored source=\(source) key=\(keyCode) down=\(isDown)")
+            return
+        }
+        lastShiftEventKeyCode = keyCode
+        lastShiftEventIsDown = isDown
+        lastShiftEventAt = now
+
         // Track key activity for adaptive poll throttling
-        lastKeyActivityAt = CFAbsoluteTimeGetCurrent()
+        lastKeyActivityAt = now
 
         if isDown {
             if activeShiftKeys.isEmpty {
                 refreshInputSource()
-                shiftDownAt = CFAbsoluteTimeGetCurrent()
+                shiftDownAt = now
                 shiftDownKeyCode = keyCode
                 shiftDownSourceID = currentSource.id
                 shiftDownBundleID = currentSource.bundleID
@@ -1102,16 +1154,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
 
-        // --- Improvement: debounce rapid shift toggles ---
-        // When Accessibility-based verification is unavailable, we debounce
-        // to stay in sync with Doubao's internal ShiftKeyEventCoalescer.
-        // When AX is active, skip the debounce because AX will verify/correct.
-        if !cachedAXTrusted {
-            let gapSinceLastToggle = now - lastShiftToggleAt
-            guard gapSinceLastToggle >= minimumShiftToggleGap else {
-                log("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
-                return
-            }
+        // Debounce rapid Shift toggles to mirror the IME's internal
+        // coalescing. AX verification can still correct us if the IME accepts
+        // a toggle that falls inside this local guard window.
+        let gapSinceLastToggle = now - lastShiftToggleAt
+        guard gapSinceLastToggle >= minimumShiftToggleGap else {
+            log("shift ignored source=\(source) reason=debounce gap=\(gapSinceLastToggle)")
+            schedulePostShiftVerification()
+            return
         }
 
         guard targetModeKnown else {
@@ -1138,6 +1188,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Timers for the post-Shift verification burst.  Kept so that rapid
     /// Shift taps cancel stale timers instead of accumulating them.
     private var postShiftTimers = [Timer]()
+    private var postShiftVerificationUntil: CFAbsoluteTime = 0
 
     /// After a Shift toggle, the IME shows a small "中"/"英" indicator window
     /// for about 1 second.  Schedule a quick burst of checks to capture and
@@ -1146,6 +1197,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         // Cancel any outstanding burst from a previous Shift tap.
         for t in postShiftTimers { t.invalidate() }
         postShiftTimers.removeAll()
+        postShiftVerificationUntil = CFAbsoluteTimeGetCurrent() + 0.9
 
         for delay in [0.15, 0.4, 0.7] {
             let t = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
@@ -1153,24 +1205,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
             postShiftTimers.append(t)
         }
-    }
-
-    // MARK: - Accessibility trust cache
-
-    private var _cachedAXTrusted: Bool?
-    private var _cachedAXTrustedAt: CFAbsoluteTime = 0
-
-    /// Cached wrapper around `AXIsProcessTrusted()`.  The trust state almost
-    /// never changes at runtime, so we re-check at most every 10 seconds.
-    private var cachedAXTrusted: Bool {
-        let now = CFAbsoluteTimeGetCurrent()
-        if let cached = _cachedAXTrusted, now - _cachedAXTrustedAt < 10.0 {
-            return cached
-        }
-        let value = AXIsProcessTrusted()
-        _cachedAXTrusted = value
-        _cachedAXTrustedAt = now
-        return value
     }
 
     private func markTargetModeUnknown(reason: String) {
@@ -1206,6 +1240,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         shiftHadOtherKey = false
         shiftSourceChanged = false
         activeShiftKeys.removeAll()
+        lastShiftEventKeyCode = nil
+        lastShiftEventIsDown = nil
+        lastShiftEventAt = 0
     }
 
     private func updateTitle() {
@@ -1527,13 +1564,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.runModal()
     }
 
-    private func noteInputEvent() {
+    private func noteInputEvent(source: String) {
+        if source == "cgevent", eventTapActive, globalFlagsMonitor != nil {
+            removeGlobalMonitor()
+            log("global monitor removed reason=cgevent-observed")
+        }
+
         guard !observedInputEvent else {
             return
         }
 
         observedInputEvent = true
-        log("input monitoring observed event")
+        log("input monitoring observed event source=\(source)")
         updateTitle()
         rebuildMenuIfOpen()
     }
@@ -1573,10 +1615,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func preferredInstalledAppPath() -> String {
-        let installed = "\(NSHomeDirectory())/Applications/\(appConfig.appName).app"
-        if FileManager.default.fileExists(atPath: installed) {
-            return installed
+        let systemInstalled = "/Applications/\(appConfig.appName).app"
+        if FileManager.default.fileExists(atPath: systemInstalled) {
+            return systemInstalled
         }
+
+        let userInstalled = "\(NSHomeDirectory())/Applications/\(appConfig.appName).app"
+        if FileManager.default.fileExists(atPath: userInstalled) {
+            return userInstalled
+        }
+
         return Bundle.main.bundlePath
     }
 

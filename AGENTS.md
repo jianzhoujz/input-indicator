@@ -265,35 +265,82 @@ distributed notification 名。唯一的 `com.bytedance.persistence` 是
 `task_for_pid()`（root + 关 SIP），不现实；进程注入也行不通，IMK
 bundle 由 macOS 加载并强制校验代码签名。
 
-### 3.5 后续可能的增强：D2（Marked Text 观察）
+### 3.5 已调研但未落地的方案：D2（焦点元素 Marked Text 观察）
 
-未来可以加一层："监听焦点应用文本框的
-`kAXSelectedTextChangedNotification`，用户敲 alpha 键后焦点元素出
-现 marked text → 中文模式；value 直接增长且 marked text 始终为空 →
-英文模式。"
+**结论：经 PoC 实测，D2 不能解决用户最关心的几个高频中文输入场景
+（Ghostty / Zed / Claude Desktop），因此暂不集成。** 设想是监听焦点
+应用文本框的 `kAXSelectedTextChangedNotification`，用户敲 alpha 键后
+焦点元素出现 marked text → 中文模式；value 直接增长且 marked text
+始终为空 → 英文模式。理论上这是 IMK 协议层强制的副作用，跨输入法
+一致。
 
-这个信号源于 IMK 协议层面的强制约定（任何 IMK 输入法在合成中文时都
-必须把 marked text 写入 client text input），跨输入法实现一致，比观
-察豆包自己的窗口更稳定。
+PoC 在 [tools/marked_text_probe.swift](tools/marked_text_probe.swift)
+（编译运行用 [tools/run_probe.sh](tools/run_probe.sh)），实测 8 个常
+用 app 的结果：
 
-代价：
+| App | Role | 中文合成时表现 | D2 是否可用 |
+|---|---|---|---|
+| 钉钉 | AXTextArea | ✅ `MARKED[AXTextInputMarkedRange]=range(0,N)` 实时随每个键变化，上屏后清空 | ✅ |
+| Fork | AXTextArea | ✅ 同上 | ✅ |
+| Microsoft Edge 地址栏 | AXTextField/AXSearchField | ❌ 拼音串直接进 AXValue（如 `v'sua'e`），marked=nil；上屏整个 value 被替换 | ❌（但有 CJK 退路信号） |
+| Safari 地址栏 | AXTextField | ❌ 同 Edge | ❌（但有 CJK 退路信号） |
+| **Ghostty**（终端） | AXTextArea | ❌ value 是终端 buffer 的全部历史（10K+ chars），不是输入区，marked=nil；终端有任何输出都会让 value 变化，无法区分用户敲键和终端重绘 | ❌ |
+| **Zed**（编辑器） | AXWindow（焦点子元素拿不到） | — | ❌ |
+| **Claude Desktop** | AXWebArea（焦点子元素拿不到） | — | ❌ |
+| 系统设置 | NO_FOCUSED_ELEMENT | — | ❌ |
 
-- 需要管理 `AXObserver` 生命周期，跟随焦点元素切换 attach / detach
-- 部分应用的 AX text field 不暴露 marked range：Electron（VSCode、
-  Slack、Discord）、Chrome web 输入框、终端（Terminal、iTerm、
-  Alacritty）。这些场景要降级回前面三层
+#### 为什么暂不集成
 
-引入前应先做最小 PoC 验证常用 app 的 marked text 信号是否稳定，再
-决定是否全量上。
+D2 完全覆盖不了 **Ghostty / Zed / Claude Desktop** 这三类高频中文输
+入场景：
 
-### 3.6 已被弃用 / 不要回退的方案
+- **Ghostty** 的 AXValue 是整个 scrollback buffer 的转录（不是当前
+  输入区），且任何输出都会让 value 变化，无法区分"用户敲键"和"终端
+  重绘"
+- **Zed** 是 GPU 自绘 UI，根本不向 AX 暴露焦点输入元素
+- **Claude Desktop** 是 Electron，AXWebArea 下的焦点子元素也拿不到
 
-| 方案 | 为什么放弃 |
-|---|---|
-| 全 IME 进程 AX 树 + `text.contains("中"/"英")` | 被设置面板、词典窗口里的「中」「英」字误吃 |
-| "敲了 ≥2 个字母没看到候选窗 → 推断英文" | 候选窗在中文模式下也常缺席（密码框、Electron、IME 自己的搜索框等） |
-| 写一个 IMK bundle 探针拿系统级事件 | 只能更早收到「输入源切换」事件，**完全解决不了**「中/英子状态」根本问题 |
-| 跨进程读豆包内存的 `InputState.enMode` | 需要 root + 关 SIP，不合规 |
+而这三个 app 恰恰都是国内开发者高频中文输入场景。如果只覆盖了浏览
+器和 IM，这三个 app 里的状态依然要靠 Shift 推断，价值有限。
+
+另外 D2 在 Safari/Edge 里也只有"退路信号"——浏览器**不严格遵守 IMK
+marked text 协议**，把拼音串直接写进 AXValue 而不是 marked text 区。
+这种行为本质上是"实时 commit + 替换"，可以从"敲 alpha 后 AXValue
+出现 CJK 字符 → 中文模式"间接判定，但跨进程时序复杂度高。
+
+#### 如果将来重启 D2，注意事项
+
+1. **不要假设 systemWide AX 能拿到焦点元素**。Electron / GPU 自绘 /
+   终端类 app 大概率拿不到。必须双路探测：先 systemWide，失败再退
+   到 `AXUIElementCreateApplication(pid).AXFocusedUIElement`，再失
+   败就放弃这个 app（不要硬猜）
+2. **Marked text 属性名是非公开常量** `AXTextInputMarkedRange`（不
+   是 `AXMarkedText` / `AXMarkedTextString`）。PoC 已经覆盖了几个
+   候选名
+3. **Safari / Chromium 系浏览器需要单独的 CJK 退路信号**——它们的
+   marked text 永远是 nil
+4. 真要集成时，**不必上 AXObserver**（生命周期管理麻烦）；轻量级
+   做法是每次 `noteAlphaKeyDown` 后 200–300ms 主动采样一次焦点元
+   素，按"marked text > CJK 检测 > 放弃" 三步判定
+5. **必须保持"正向证据策略"**：D2 永远不应该用于推断英文模式（推断
+   英文还是只能靠 Shift 翻转或 AX 读到「英」字符）
+
+### 3.6 已被弃用 / 已被验证不可行的方案
+
+> **任何 AI Agent 在动手实现新的状态推断方案前，请先把这张表读完。**
+> 表里每一项都是已经投入精力调研或实现过、最终证伪的路径。**重复尝
+> 试这些方案是浪费时间。**
+
+| 方案 | 状态 | 为什么不行 |
+|---|---|---|
+| 全 IME 进程 AX 树 + `text.contains("中"/"英")` | 已实现并回退 | 被设置面板、词典窗口里的「中」「英」字误吃，导致状态错乱 |
+| "敲了 ≥2 个字母没看到候选窗 → 推断英文" | 已实现并回退 | 候选窗在中文模式下也常缺席（密码框、Electron、IME 自己的搜索框、Doubao 卡顿等），是「莫名跳到英文」的最大根因 |
+| 写一个 IMK bundle 探针拿系统级事件 | 已调研放弃 | 只能更早收到「输入源切换」事件，**完全解决不了**「中/英子状态」根本问题，且会污染系统输入源列表 |
+| 跨进程读豆包内存的 `InputState.enMode` | 已调研放弃 | 需要 root + 关 SIP；进程注入也行不通（IMK bundle 由 macOS 强制校验代码签名）。不合规 |
+| 解析豆包 alog 日志拿状态 | 已调研放弃 | alog 是 AES 加密的（magic `a1 09 00 00`），ByteDance 不公开解密工具；且日志是事后写盘的，**不是实时状态源** |
+| 读豆包 plist / MMKV / 数据库拿状态 | 已调研放弃 | 中英文状态完全不写盘（按 Shift 是高频操作，写盘损耗 SSD 且无必要）。所有 plist / MMKV / Cache.db 内容都跟模式无关 |
+| D2：观察焦点元素的 marked text | 已 PoC 验证不全量上 | Ghostty / Zed / Claude Desktop 这三类高频中文输入场景全部失败（详见 §3.5 表）。覆盖率不够，集成成本不划算 |
+| D1：自己写一个 IMK 客户端 binary 注册到系统 | 与"IMK bundle 探针"等价 | 同上，解决不了子状态问题 |
 
 ---
 
